@@ -1,0 +1,40 @@
+# ===== workflows/FUNC_Conn/Snakefile =====
+
+# 固定工作目录为项目根（容器内是 /workspace）
+workdir: "/workspace"
+
+# 读取全局配置
+configfile: "config/config.yaml"
+
+# 便捷别名（来自 config/config.yaml）
+DATA     = config["paths"]["data"]       # e.g. "shared/data"
+RESULTS  = config["paths"]["results"]    # e.g. "shared/results"
+SUBJECTS = config["subjects"]
+
+rule all:
+    input:
+        expand(f"{RESULTS}/metrics/{{subject}}_mcc.csv", subject=SUBJECTS)
+
+rule preprocess:
+    input:
+        raw=f"{DATA}/raw/{{subject}}.edf"
+    output:
+        proc=f"{DATA}/processed/{{subject}}_clean.npy"
+    shell:
+        "python src/preprocessing/preprocess.py {input.raw} {output.proc}"
+
+rule compute_adtf:
+    input:
+        proc=f"{DATA}/processed/{{subject}}_clean.npy"
+    output:
+        out=f"{RESULTS}/metrics/{{subject}}_adtf.npy"
+    shell:
+        "python src/connectivity/adtf_func.py {input.proc} {output.out}"
+
+rule compute_metrics:
+    input:
+        adtf=f"{RESULTS}/metrics/{{subject}}_adtf.npy"
+    output:
+        mcc=f"{RESULTS}/metrics/{{subject}}_mcc.csv"
+    shell:
+        "python src/utils/metrics.py {input.adtf} {output.mcc}"

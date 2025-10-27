@@ -1,0 +1,8 @@
+cores: 64
+jobs: 200
+latency-wait: 120
+restart-times: 1
+rerun-incomplete: true
+cluster: "sbatch -A your_account -t {resources.time} -p your_partition -c {threads} --mem={resources.mem}"
+default-resources: [time= "02:00:00", mem="8G"]
+use-conda: true

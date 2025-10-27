@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+.env
+
+# Data & results
+shared/data/
+shared/results/
+shared/tmp/
+notebooks/old_fc
+src/preprocessing_old
+
+# Images
+*.png
+
+# OS
+.DS_Store
+Thumbs.db

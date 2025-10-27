@@ -1,0 +1,4 @@
+# Placeholder Snakefile for BRAIN_Model
+rule all:
+    input:
+        []

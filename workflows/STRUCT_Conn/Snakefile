@@ -1,0 +1,4 @@
+# Placeholder Snakefile for STRUCT_Conn
+rule all:
+    input:
+        []

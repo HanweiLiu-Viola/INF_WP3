@@ -1,0 +1,48 @@
+
+services:
+  func_conn:
+    build:
+      context: ../
+      dockerfile: docker/FUNC_Conn/Dockerfile
+    image: inf_wp3/func_conn:latest
+    container_name: func_conn
+    env_file:
+      - ../.env
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace
+      - ${SHARED_HOST_PATH:-../shared}:/workspace/shared
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    command: bash -lc "jupyter lab --ip=0.0.0.0 --no-browser --allow-root"
+    tty: true
+
+  struct_conn:
+    build:
+      context: ../
+      dockerfile: docker/STRUCT_Conn/Dockerfile
+    image: inf_wp3/struct_conn:latest
+    container_name: struct_conn
+    env_file:
+      - ../.env
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace
+      - ${SHARED_HOST_PATH:-../shared}:/workspace/shared
+    command: bash -lc "sleep infinity"
+    tty: true
+
+  brain_model:
+    build:
+      context: ../
+      dockerfile: docker/BRAIN_Model/Dockerfile
+    image: inf_wp3/brain_model:latest
+    container_name: brain_model
+    env_file:
+      - ../.env
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace
+      - ${SHARED_HOST_PATH:-../shared}:/workspace/shared
+    command: bash -lc "sleep infinity"
+    tty: true

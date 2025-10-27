@@ -1,0 +1,11 @@
+eeg_lfp_preprocessing/QUICKSTART.md
+eeg_lfp_preprocessing/README.md
+eeg_lfp_preprocessing/notebooks/01_complete_preprocessing.ipynb
+eeg_lfp_preprocessing/requirements.txt
+eeg_lfp_preprocessing/src/preprocessing/__init__.py
+eeg_lfp_preprocessing/src/preprocessing/data_validation.py
+eeg_lfp_preprocessing/src/preprocessing/eeg_preprocessing.py
+eeg_lfp_preprocessing/src/preprocessing/joint_preprocessing.py
+eeg_lfp_preprocessing/src/preprocessing/lfp_preprocessing.py
+eeg_lfp_preprocessing/src/preprocessing/quality_control.py
+eeg_lfp_preprocessing/src/preprocessing/signal_cleaning.py

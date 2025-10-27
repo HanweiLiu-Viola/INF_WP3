@@ -1,0 +1,103 @@
+Assuming unrestricted shared filesystem usage.
+host: 74dface0d4d2
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 4
+Rules claiming more threads will be scaled down.
+Job stats:
+job                count
+---------------  -------
+all                    1
+compute_adtf           2
+compute_metrics        2
+preprocess             2
+total                  7
+
+Select jobs to execute...
+Execute 2 jobs...
+[Sun Oct  5 21:28:01 2025]
+localrule preprocess:
+    input: shared/data/raw/sub01.edf
+    output: shared/data/processed/sub01_clean.npy
+    jobid: 3
+    reason: Missing output files: shared/data/processed/sub01_clean.npy
+    wildcards: subject=sub01
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:01 2025]
+localrule preprocess:
+    input: shared/data/raw/sub02.edf
+    output: shared/data/processed/sub02_clean.npy
+    jobid: 6
+    reason: Missing output files: shared/data/processed/sub02_clean.npy
+    wildcards: subject=sub02
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:01 2025]
+Finished jobid: 3 (Rule: preprocess)
+1 of 7 steps (14%) done
+Select jobs to execute...
+Execute 1 jobs...
+[Sun Oct  5 21:28:01 2025]
+localrule compute_adtf:
+    input: shared/data/processed/sub01_clean.npy
+    output: shared/results/metrics/sub01_adtf.npy
+    jobid: 2
+    reason: Missing output files: shared/results/metrics/sub01_adtf.npy; Input files updated by another job: shared/data/processed/sub01_clean.npy
+    wildcards: subject=sub01
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:01 2025]
+Finished jobid: 6 (Rule: preprocess)
+2 of 7 steps (29%) done
+Select jobs to execute...
+Execute 1 jobs...
+[Sun Oct  5 21:28:01 2025]
+localrule compute_adtf:
+    input: shared/data/processed/sub02_clean.npy
+    output: shared/results/metrics/sub02_adtf.npy
+    jobid: 5
+    reason: Missing output files: shared/results/metrics/sub02_adtf.npy; Input files updated by another job: shared/data/processed/sub02_clean.npy
+    wildcards: subject=sub02
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:02 2025]
+Finished jobid: 5 (Rule: compute_adtf)
+3 of 7 steps (43%) done
+Select jobs to execute...
+Execute 1 jobs...
+[Sun Oct  5 21:28:02 2025]
+localrule compute_metrics:
+    input: shared/results/metrics/sub02_adtf.npy
+    output: shared/results/metrics/sub02_mcc.csv
+    jobid: 4
+    reason: Missing output files: shared/results/metrics/sub02_mcc.csv; Input files updated by another job: shared/results/metrics/sub02_adtf.npy
+    wildcards: subject=sub02
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:02 2025]
+Finished jobid: 2 (Rule: compute_adtf)
+4 of 7 steps (57%) done
+Select jobs to execute...
+Execute 1 jobs...
+[Sun Oct  5 21:28:02 2025]
+localrule compute_metrics:
+    input: shared/results/metrics/sub01_adtf.npy
+    output: shared/results/metrics/sub01_mcc.csv
+    jobid: 1
+    reason: Missing output files: shared/results/metrics/sub01_mcc.csv; Input files updated by another job: shared/results/metrics/sub01_adtf.npy
+    wildcards: subject=sub01
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:02 2025]
+Finished jobid: 4 (Rule: compute_metrics)
+5 of 7 steps (71%) done
+[Sun Oct  5 21:28:03 2025]
+Finished jobid: 1 (Rule: compute_metrics)
+6 of 7 steps (86%) done
+Select jobs to execute...
+Execute 1 jobs...
+[Sun Oct  5 21:28:03 2025]
+localrule all:
+    input: shared/results/metrics/sub01_mcc.csv, shared/results/metrics/sub02_mcc.csv
+    jobid: 0
+    reason: Input files updated by another job: shared/results/metrics/sub02_mcc.csv, shared/results/metrics/sub01_mcc.csv
+    resources: tmpdir=/tmp
+[Sun Oct  5 21:28:03 2025]
+Finished jobid: 0 (Rule: all)
+7 of 7 steps (100%) done
+Complete log(s): /workspace/.snakemake/log/2025-10-05T212801.449849.snakemake.log

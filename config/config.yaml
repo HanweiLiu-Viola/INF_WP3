@@ -1,0 +1,9 @@
+# Global workflow parameters shared by all domains
+subjects: ["sub01", "sub02"]
+sampling_rate: 250
+window_size: 250
+frequency_band: [13, 30]
+paths:
+  data: "shared/data"
+  results: "shared/results"
+  notebooks: "notebooks"

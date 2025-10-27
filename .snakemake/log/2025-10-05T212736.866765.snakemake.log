@@ -1,0 +1,9 @@
+Assuming unrestricted shared filesystem usage.
+host: 74dface0d4d2
+Building DAG of jobs...
+MissingInputException in rule preprocess in file "/workspace/workflows/FUNC_Conn/Snakefile", line 18:
+Missing input files for rule preprocess:
+    output: shared/data/processed/sub01_clean.npy
+    wildcards: subject=sub01
+    affected files:
+        shared/data/raw/sub01.edf
