@@ -31,6 +31,48 @@ logger = logging.getLogger(__name__)
 # Utility Functions
 # ============================================================
 
+def _channel_variances(
+    epochs: mne.Epochs,
+    picks: Optional[Sequence[int]] = None,
+    use_nanvar: bool = True,
+) -> np.ndarray:
+    """Return per-channel variance across epochs and times."""
+
+    data = epochs.get_data()
+    if picks is None:
+        picks = np.arange(data.shape[1])
+
+    data_sel = data[:, picks, :]
+
+    if use_nanvar:
+        variances = np.nanvar(data_sel, axis=(0, 2))
+    else:
+        variances = np.var(data_sel, axis=(0, 2))
+
+    return variances
+
+
+def find_problematic_channels(
+    epochs: mne.Epochs,
+    picks: Optional[Sequence[int]] = None,
+    variance_floor: float = 1e-14,
+) -> List[str]:
+    """Detect channels that are constant, contain NaNs, or have tiny variance."""
+
+    if picks is None:
+        picks = np.arange(len(epochs.ch_names))
+
+    variances = _channel_variances(epochs, picks=picks)
+
+    bad_mask = ~np.isfinite(variances) | (variances <= variance_floor)
+    if not np.any(bad_mask):
+        return []
+
+    picks_array = np.asarray(picks)
+    bad_indices = picks_array[bad_mask]
+    return [epochs.ch_names[idx] for idx in bad_indices]
+
+
 def validate_electrode_positions(epochs: mne.Epochs) -> Tuple[bool, str]:
     """
     Validate that epochs have proper 3D electrode positions.
@@ -607,6 +649,36 @@ class InverseSolutionComputer:
         self.noise_cov = noise_cov
         self.inverse_operator = None
         
+    def _stabilize_covariance_diagonal(
+        self,
+        cov_data: np.ndarray,
+        variance_floor: float = 1e-13,
+    ) -> Tuple[np.ndarray, float]:
+        """Ensure the covariance diagonal is strictly positive and finite."""
+
+        diag = np.diag(cov_data).copy()
+
+        finite_positive = diag[np.isfinite(diag) & (diag > variance_floor)]
+        if finite_positive.size > 0:
+            reference_scale = float(np.median(finite_positive))
+        else:
+            data_variances = _channel_variances(self.epochs)
+            finite_data = data_variances[np.isfinite(data_variances) & (data_variances > 0)]
+            if finite_data.size > 0:
+                reference_scale = float(np.median(finite_data))
+            else:
+                reference_scale = variance_floor
+
+        reference_scale = max(reference_scale, variance_floor)
+
+        needs_fix = (~np.isfinite(diag)) | (diag <= variance_floor)
+        if np.any(needs_fix):
+            diag[needs_fix] = reference_scale
+            cov_data = cov_data.copy()
+            cov_data[np.diag_indices_from(cov_data)] = diag
+
+        return cov_data, reference_scale
+
     def compute_noise_covariance(
         self,
         tmin: Optional[float] = None,
@@ -638,47 +710,44 @@ class InverseSolutionComputer:
         logger.info("Computing noise covariance from baseline...")
         logger.info(f"  Method: {method}, regularization: {reg}")
         
-        # STEP 1: Compute base covariance
         noise_cov = mne.compute_covariance(
             self.epochs,
             tmin=tmin,
             tmax=tmax,
             method=method,
-            verbose=False
+            verbose=False,
         )
-        
-        # STEP 2: Apply manual regularization if needed
+
+        cov_data = noise_cov.data.copy()
+        cov_data, reference_scale = self._stabilize_covariance_diagonal(cov_data)
+
         if reg > 0:
             logger.info(f"  Applying manual regularization: {reg}")
-            
-            # Get a COPY of the data (can't modify .data directly)
-            cov_data = noise_cov.data.copy()
-            
-            # Calculate regularization amount
+
             diag_mean = np.mean(np.diag(cov_data))
             reg_amount = reg * diag_mean
-            
-            # Add to diagonal
+
+            if not np.isfinite(reg_amount) or reg_amount <= 0:
+                reg_amount = reg * reference_scale
+
             n_channels = cov_data.shape[0]
             cov_data += reg_amount * np.eye(n_channels)
-            
+
             logger.info(f"    Added {reg_amount:.6e} to diagonal")
-            
-            # Create new Covariance object with regularized data
-            self.noise_cov = mne.Covariance(
-                data=cov_data,
-                names=noise_cov.ch_names,
-                bads=noise_cov['bads'],
-                projs=noise_cov['projs'],
-                nfree=noise_cov['nfree']
-            )
-        else:
-            self.noise_cov = noise_cov
-        
+
+        self.noise_cov = mne.Covariance(
+            data=cov_data,
+            names=noise_cov.ch_names,
+            bads=noise_cov['bads'],
+            projs=noise_cov['projs'],
+            nfree=noise_cov['nfree'],
+        )
+
         logger.info(f"✓ Noise covariance computed")
         logger.info(f"  Shape: {self.noise_cov.data.shape}")
         logger.info(f"  Diagonal mean: {np.diag(self.noise_cov.data).mean():.6e}")
-        
+        logger.info(f"  Smallest variance after stabilisation: {np.diag(self.noise_cov.data).min():.6e}")
+
         # STEP 3: Validate
         if np.any(np.isnan(self.noise_cov.data)) or np.any(np.isinf(self.noise_cov.data)):
             logger.error("❌ Noise covariance contains NaN or Inf!")
@@ -723,11 +792,43 @@ class InverseSolutionComputer:
                 loose=loose,
                 depth=depth,
                 fixed=fixed,
-                verbose=False
+                verbose=False,
             )
-            
+
             logger.info("✓ Inverse operator created")
-            
+
+        except ValueError as e:
+            if "array must not contain infs or NaNs" in str(e):
+                logger.warning(
+                    "Inverse operator creation failed due to numerical instability. "
+                    "Increasing diagonal regularisation and retrying."
+                )
+                cov_data = self.noise_cov.data.copy()
+                cov_data += 1e-12 * np.trace(cov_data) / cov_data.shape[0] * np.eye(cov_data.shape[0])
+                self.noise_cov = mne.Covariance(
+                    data=cov_data,
+                    names=self.noise_cov.ch_names,
+                    bads=self.noise_cov['bads'],
+                    projs=self.noise_cov['projs'],
+                    nfree=self.noise_cov['nfree'],
+                )
+                self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                    self.epochs.info,
+                    self.forward,
+                    self.noise_cov,
+                    loose=loose,
+                    depth=depth,
+                    fixed=fixed,
+                    verbose=False,
+                )
+                logger.info("✓ Inverse operator created after stabilisation")
+            else:
+                logger.error(f"❌ Failed to create inverse operator: {e}")
+                logger.error("   This usually means:")
+                logger.error("   1. Noise covariance is too small or unstable")
+                logger.error("   2. Electrode positions/coregistration are wrong")
+                logger.error("   3. Forward solution has numerical issues")
+                raise
         except Exception as e:
             logger.error(f"❌ Failed to create inverse operator: {e}")
             logger.error("   This usually means:")
@@ -735,7 +836,7 @@ class InverseSolutionComputer:
             logger.error("   2. Electrode positions/coregistration are wrong")
             logger.error("   3. Forward solution has numerical issues")
             raise
-        
+
         return self.inverse_operator
     
     def apply_inverse(
@@ -1020,6 +1121,31 @@ def run_source_reconstruction_pipeline(
         epochs_used = epochs.copy()
 
     logger.info("Epochs to process: %d", len(epochs_used))
+
+    logger.info("\n[STEP 0c] Preparing channel list for forward/inverse modelling...")
+    eeg_picks = mne.pick_types(epochs_used.info, eeg=True, exclude=())
+    if eeg_picks.size == 0:
+        raise ValueError("No EEG channels available for source reconstruction.")
+
+    non_eeg_channels = [
+        epochs_used.ch_names[idx]
+        for idx in range(len(epochs_used.ch_names))
+        if idx not in eeg_picks
+    ]
+    epochs_used = epochs_used.copy()
+    if non_eeg_channels:
+        logger.info("  Dropping non-EEG channels: %s", ", ".join(non_eeg_channels))
+        epochs_used.pick(eeg_picks)
+
+    bad_channels = find_problematic_channels(epochs_used)
+    if bad_channels:
+        logger.warning(
+            "  Removing channels with tiny variance or NaNs: %s",
+            ", ".join(bad_channels),
+        )
+        epochs_used.drop_channels(bad_channels)
+
+    logger.info("  Channels retained for modelling: %d", len(epochs_used.ch_names))
 
     # Step 0.5: Load and validate trans file
     trans = None

@@ -56,7 +56,20 @@ def validate_preparation(
 
     if n_epochs > 300:
         print("  ⚠️ Epoch数量较多，建议在源重建时使用 max_epochs 参数以避免内存压力")
-    
+
+    eeg_picks = mne.pick_types(epochs.info, eeg=True, exclude=())
+    if eeg_picks.size == 0:
+        print("  ❌ 未找到EEG通道，无法进行源重建")
+        all_checks_passed = False
+    else:
+        variances = np.nanvar(epochs.get_data()[:, eeg_picks, :], axis=(0, 2))
+        bad_mask = ~np.isfinite(variances) | (variances <= 1e-14)
+        if np.any(bad_mask):
+            bad_channels = np.array(epochs.ch_names)[eeg_picks][bad_mask]
+            print(
+                f"  ⚠️ 以下通道方差过小或存在NaN，将在源重建前被移除: {', '.join(bad_channels)}"
+            )
+
     # ========================================
     # 检查2: 电极位置 (CRITICAL)
     # ========================================
