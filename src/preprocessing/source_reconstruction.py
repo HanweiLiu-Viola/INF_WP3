@@ -648,6 +648,9 @@ class InverseSolutionComputer:
         self.forward = forward
         self.noise_cov = noise_cov
         self.inverse_operator = None
+        self.noise_cov_strategy: Optional[str] = (
+            'provided' if noise_cov is not None else None
+        )
         
     def _stabilize_covariance_diagonal(
         self,
@@ -752,7 +755,9 @@ class InverseSolutionComputer:
         if np.any(np.isnan(self.noise_cov.data)) or np.any(np.isinf(self.noise_cov.data)):
             logger.error("❌ Noise covariance contains NaN or Inf!")
             raise ValueError("Noise covariance contains NaN or Inf values!")
-        
+
+        self.noise_cov_strategy = 'baseline'
+
         return self.noise_cov
     
     def make_inverse_operator(
@@ -798,20 +803,37 @@ class InverseSolutionComputer:
             logger.info("✓ Inverse operator created")
 
         except ValueError as e:
-            if "array must not contain infs or NaNs" in str(e):
-                logger.warning(
-                    "Inverse operator creation failed due to numerical instability. "
-                    "Increasing diagonal regularisation and retrying."
-                )
-                cov_data = self.noise_cov.data.copy()
-                cov_data += 1e-12 * np.trace(cov_data) / cov_data.shape[0] * np.eye(cov_data.shape[0])
-                self.noise_cov = mne.Covariance(
-                    data=cov_data,
-                    names=self.noise_cov.ch_names,
-                    bads=self.noise_cov['bads'],
-                    projs=self.noise_cov['projs'],
-                    nfree=self.noise_cov['nfree'],
-                )
+            if "array must not contain infs or NaNs" not in str(e):
+                logger.error(f"❌ Failed to create inverse operator: {e}")
+                logger.error("   This usually means:")
+                logger.error("   1. Noise covariance is too small or unstable")
+                logger.error("   2. Electrode positions/coregistration are wrong")
+                logger.error("   3. Forward solution has numerical issues")
+                raise
+
+            logger.warning(
+                "Inverse operator creation failed due to numerical instability. "
+                "Increasing diagonal regularisation and retrying."
+            )
+
+            cov_data = self.noise_cov.data.copy()
+            trace = np.trace(cov_data)
+            n_ch = cov_data.shape[0]
+            if not np.isfinite(trace) or trace <= 0:
+                trace = 1.0
+            jitter = 1e-12 * trace / float(n_ch)
+            cov_data = cov_data + jitter * np.eye(n_ch)
+
+            self.noise_cov = mne.Covariance(
+                data=cov_data,
+                names=self.noise_cov.ch_names,
+                bads=self.noise_cov['bads'],
+                projs=self.noise_cov['projs'],
+                nfree=self.noise_cov['nfree'],
+            )
+            self.noise_cov_strategy = 'baseline+jitter'
+
+            try:
                 self.inverse_operator = mne.minimum_norm.make_inverse_operator(
                     self.epochs.info,
                     self.forward,
@@ -822,13 +844,54 @@ class InverseSolutionComputer:
                     verbose=False,
                 )
                 logger.info("✓ Inverse operator created after stabilisation")
-            else:
-                logger.error(f"❌ Failed to create inverse operator: {e}")
-                logger.error("   This usually means:")
-                logger.error("   1. Noise covariance is too small or unstable")
-                logger.error("   2. Electrode positions/coregistration are wrong")
-                logger.error("   3. Forward solution has numerical issues")
-                raise
+            except ValueError as retry_error:
+                if "array must not contain infs or NaNs" not in str(retry_error):
+                    logger.error(f"❌ Failed to create inverse operator: {retry_error}")
+                    logger.error("   This usually means:")
+                    logger.error("   1. Noise covariance is too small or unstable")
+                    logger.error("   2. Electrode positions/coregistration are wrong")
+                    logger.error("   3. Forward solution has numerical issues")
+                    raise
+
+                logger.warning(
+                    "Retrying inverse operator creation with diagonal fallback "
+                    "covariance estimated from channel variances."
+                )
+
+                data_variances = _channel_variances(self.epochs)
+                variance_floor = 1e-13
+                finite = data_variances[np.isfinite(data_variances) & (data_variances > variance_floor)]
+                if finite.size == 0:
+                    reference = variance_floor
+                else:
+                    reference = float(np.median(finite))
+
+                diag = np.clip(data_variances, variance_floor, None)
+                diag[~np.isfinite(diag)] = reference
+
+                cov_data = np.diag(diag)
+                fallback_cov = mne.Covariance(
+                    data=cov_data,
+                    names=self.epochs.ch_names,
+                    bads=[],
+                    projs=[],
+                    nfree=len(self.epochs),
+                )
+
+                self.noise_cov = fallback_cov
+                self.noise_cov_strategy = 'diagonal-variance'
+                self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                    self.epochs.info,
+                    self.forward,
+                    self.noise_cov,
+                    loose=loose,
+                    depth=depth,
+                    fixed=fixed,
+                    verbose=False,
+                )
+                logger.info(
+                    "✓ Inverse operator created using diagonal fallback covariance"
+                )
         except Exception as e:
             logger.error(f"❌ Failed to create inverse operator: {e}")
             logger.error("   This usually means:")
@@ -1072,6 +1135,8 @@ def run_source_reconstruction_pipeline(
         - 'inv': Inverse operator
         - 'trans': Transform used
         - 'atlas': Atlas
+        - 'noise_covariance': Noise covariance matrix used
+        - 'noise_cov_strategy': String describing how the covariance was obtained
         - 'method': Method used
         - 'epochs_subset': Epochs object actually used in the inverse step
         - 'epoch_indices': Indices (relative to the original epochs) that were
@@ -1227,6 +1292,8 @@ def run_source_reconstruction_pipeline(
         'inv': inv_computer.inverse_operator,
         'trans': trans,
         'atlas': atlas,
+        'noise_covariance': inv_computer.noise_cov,
+        'noise_cov_strategy': inv_computer.noise_cov_strategy,
         'method': method,
         'epochs_subset': epochs_used,
         'epoch_indices': selection if selection is not None else np.arange(len(epochs_used)),
