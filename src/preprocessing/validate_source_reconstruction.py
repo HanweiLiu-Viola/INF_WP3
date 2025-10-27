@@ -338,10 +338,11 @@ def validate_preparation(
             print(f"    trans_file='{trans_file}',")
         else:
             print("    trans_file=None,  # ⚠️ 建议提供trans文件")
-        print("    method='sLORETA',")
+        print("    method='eLORETA',")
         print("    lambda2=1.0/9.0,")
         print("    noise_cov_reg=0.1,")
-        print("    n_jobs=2")
+        print("    n_jobs=2,")
+        print("    max_epochs=40  # 避免一次性处理全部epoch导致内存问题")
         print(")")
         print("```")
     else:

@@ -908,11 +908,12 @@ def run_source_reconstruction_pipeline(
     headmodel_file: Union[str, Path],
     atlas_dir: Union[str, Path],
     trans_file: Optional[Union[str, Path]] = None,
-    method: str = 'sLORETA',
+    method: str = 'eLORETA',
     lambda2: float = 1.0 / 9.0,
     noise_cov_reg: float = 0.1,
     roi_indices: Optional[List[int]] = None,
-    n_jobs: int = 1
+    n_jobs: int = 1,
+    max_epochs: Optional[int] = None
 ) -> Dict:
     """
     Complete source reconstruction pipeline with real coregistration.
@@ -938,6 +939,10 @@ def run_source_reconstruction_pipeline(
         Specific ROI indices to use
     n_jobs : int
         Number of parallel jobs
+    max_epochs : int, optional
+        If provided, limit the reconstruction to the first ``max_epochs`` epochs
+        to reduce memory usage. Useful when working with large Epochs objects
+        that may overwhelm the kernel.
         
     Returns
     -------
@@ -958,9 +963,30 @@ def run_source_reconstruction_pipeline(
     logger.info("With Real Coregistration")
     logger.info("="*60)
     
+    total_epochs = len(epochs)
+    epochs_to_use = epochs
+    if max_epochs is not None:
+        if max_epochs < 1:
+            raise ValueError("max_epochs must be a positive integer")
+        if max_epochs < total_epochs:
+            logger.info(
+                f"Limiting source reconstruction to the first {max_epochs} "
+                f"epochs out of {total_epochs} available"
+            )
+            epochs_to_use = epochs[:max_epochs]
+        else:
+            logger.info(
+                f"Requested max_epochs={max_epochs} but only {total_epochs} "
+                "epochs are available; using all epochs"
+            )
+
+    logger.info(
+        f"Epochs available: {total_epochs}; using {len(epochs_to_use)} for reconstruction"
+    )
+
     # Step 0: Validate electrode positions
     logger.info("\n[STEP 0] Validating electrode positions...")
-    is_valid, message = validate_electrode_positions(epochs)
+    is_valid, message = validate_electrode_positions(epochs_to_use)
     if not is_valid:
         logger.error(f"❌ {message}")
         logger.error("Please load 3D coordinates from coordinates.xml before running!")
@@ -1000,12 +1026,12 @@ def run_source_reconstruction_pipeline(
     
     # Step 4: Compute forward solution
     logger.info("\n[STEP 4] Computing forward solution...")
-    fwd_builder = ForwardSolutionBuilder(epochs, src, trans=trans)
+    fwd_builder = ForwardSolutionBuilder(epochs_to_use, src, trans=trans)
     fwd = fwd_builder.compute_forward(n_jobs=n_jobs)
     
     # Step 5: Compute inverse solution
     logger.info("\n[STEP 5] Computing inverse solution...")
-    inv_computer = InverseSolutionComputer(epochs, fwd)
+    inv_computer = InverseSolutionComputer(epochs_to_use, fwd)
     inv_computer.compute_noise_covariance(reg=noise_cov_reg)
     inv_computer.make_inverse_operator()
     
