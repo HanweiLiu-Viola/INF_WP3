@@ -48,10 +48,14 @@ def validate_preparation(
     # ========================================
     print("\n[检查 1/5] Epochs基本信息")
     print(f"  通道数: {len(epochs.ch_names)}")
-    print(f"  Epochs数: {len(epochs)}")
+    n_epochs = len(epochs)
+    print(f"  Epochs数: {n_epochs}")
     print(f"  采样率: {epochs.info['sfreq']} Hz")
     print(f"  时间窗口: [{epochs.times[0]:.3f}, {epochs.times[-1]:.3f}] s")
     print("  ✓ Epochs信息正常")
+
+    if n_epochs > 300:
+        print("  ⚠️ Epoch数量较多，建议在源重建时使用 max_epochs 参数以避免内存压力")
     
     # ========================================
     # 检查2: 电极位置 (CRITICAL)
@@ -328,7 +332,7 @@ def validate_preparation(
         print("✅ 所有检查通过! 可以运行源重建了")
         print("\n建议的命令:")
         print("```python")
-        print("from source_reconstruction_v2 import run_source_reconstruction_pipeline")
+        print("from preprocessing.source_reconstruction import run_source_reconstruction_pipeline")
         print()
         print("results = run_source_reconstruction_pipeline(")
         print("    epochs=epochs_clean,")
@@ -340,7 +344,9 @@ def validate_preparation(
             print("    trans_file=None,  # ⚠️ 建议提供trans文件")
         print("    method='sLORETA',")
         print("    lambda2=1.0/9.0,")
+        print("    noise_cov_method='auto',")
         print("    noise_cov_reg=0.1,")
+        print("    max_epochs=200,")
         print("    n_jobs=2")
         print(")")
         print("```")
