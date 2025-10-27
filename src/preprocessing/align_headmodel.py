@@ -199,24 +199,96 @@ def _get_eeg_points_from_raw(raw: mne.io.BaseRaw) -> np.ndarray:
 # Main: make_trans_from_coordinates
 # ---------------------------
 
+def _extract_scalp_points_from_headmodel(headmodel) -> np.ndarray:
+    """Return scalp surface points (in meters) from a FieldTrip headmodel."""
+
+    def _as_array(obj, attr):
+        data = getattr(obj, attr, None)
+        if data is None:
+            return np.empty((0, 3), float)
+        arr = np.array(data, float)
+        if arr.ndim != 2 or arr.shape[1] != 3:
+            return np.empty((0, 3), float)
+        return arr
+
+    scalp = np.empty((0, 3), float)
+
+    # FieldTrip FEM models store outer surfaces in the 'bnd' attribute
+    if hasattr(headmodel, "bnd"):
+        bnd = getattr(headmodel, "bnd")
+        if not isinstance(bnd, (list, tuple)):
+            bnd = [bnd]
+        for surface in bnd:
+            pos = _as_array(surface, "pos")
+            if pos.size:
+                scalp = pos
+                break
+
+    if scalp.size == 0:
+        scalp = _as_array(headmodel, "pos")
+
+    if scalp.size == 0:
+        raise RuntimeError("Could not find scalp vertices in FieldTrip headmodel.")
+
+    unit = getattr(headmodel, "unit", "")
+    if isinstance(unit, bytes):
+        unit = unit.decode("utf8", "ignore")
+    unit = str(unit).lower().strip()
+
+    if unit in {"mm", "millimeter", "millimetre", "millimeters", "millimetres"}:
+        scale = 1e-3
+    elif unit in {"cm", "centimeter", "centimetre", "centimeters", "centimetres"}:
+        scale = 1e-2
+    else:
+        scale = 1.0
+
+    return scalp * scale
+
+
 def make_trans_from_coordinates(
     raw: mne.io.BaseRaw,
     coordinates_xml: str | Path,
     ft_headmodel_mat: str | Path,
     out_trans_path: str | Path,
-    max_iter: int = 60
+    max_iter: int = 60,
+    scalp_decimation: int | None = 5,
+    random_state: int | None = None,
 ) -> tuple[mne.transforms.Transform, float, float]:
-    """
-    High-level convenience function:
-    1) Load coordinates.xml and apply as DigMontage to 'raw'.
-    2) Load FieldTrip headmodel (.mat), convert to meters, and take convex hull vertices as scalp proxy.
-    3) Rigid ICP to align EEG dig points (head coords) to the scalp proxy.
-    4) Build an MNE head->MRI Transform and write to out_trans_path.
-       (We treat the headmodel space as 'MRI' frame for this coarse alignment.)
-    Returns:
-      - trans (mne.Transform, head->mri)
-      - mean_distance_mm (float): mean nearest distance after ICP
-      - p95_distance_mm (float): 95th percentile nearest distance after ICP
+    """Align EEG dig points to a FieldTrip scalp mesh using rigid ICP.
+
+    Parameters
+    ----------
+    raw
+        Raw instance that already contains the EEG data.
+    coordinates_xml
+        Path to the EGI ``coordinates.xml`` file.
+    ft_headmodel_mat
+        FieldTrip headmodel ``.mat`` file (typically FEM).
+    out_trans_path
+        Output path for the saved ``.fif`` transform.
+    max_iter
+        Maximum ICP iterations.
+    scalp_decimation
+        Randomly subsample scalp vertices when the mesh is very dense to
+        speed up KD-Tree queries. ``None`` disables decimation.
+    random_state
+        Optional seed for the decimation RNG.
+
+    Returns
+    -------
+    trans, mean_distance_mm, p95_distance_mm
+        The computed transform and post-alignment error metrics.
+
+    Notes
+    -----
+    The routine performs the following steps:
+
+    1. Load ``coordinates.xml`` and apply it to the raw object to populate
+       ``raw.info['dig']``.
+    2. Load the FieldTrip headmodel, convert coordinates to meters and extract
+       the scalp surface vertices.
+    3. Run a rigid ICP alignment between the EEG dig points and scalp surface.
+    4. Write the resulting head→MRI transform to ``out_trans_path``.
     """
     coordinates_xml = Path(coordinates_xml)
     ft_headmodel_mat = Path(ft_headmodel_mat)
@@ -231,16 +303,23 @@ def make_trans_from_coordinates(
     if headmodel is None:
         raise RuntimeError("FieldTrip .mat file has no 'headmodel' struct.")
 
-    pos = np.array(getattr(headmodel, "pos", None), float)
-    if pos.size == 0:
-        raise RuntimeError("headmodel.pos is missing or empty.")
-    # FieldTrip often uses mm; convert to meters if values look large
-    if np.max(np.abs(pos)) > 1.0:
-        pos = pos * 1e-3
+    scalp = _extract_scalp_points_from_headmodel(headmodel)
 
-    # Use convex hull vertices as a scalp proxy for coarse alignment
-    hull = ConvexHull(pos)
-    scalp = pos[hull.vertices]
+    if scalp_decimation and scalp.shape[0] > 5000:
+        rng = np.random.default_rng(random_state)
+        keep = max(int(scalp.shape[0] / scalp_decimation), 1500)
+        keep = min(keep, scalp.shape[0])
+        idx = rng.choice(scalp.shape[0], size=keep, replace=False)
+        idx.sort()
+        scalp = scalp[idx]
+
+    if scalp.size == 0:
+        raise RuntimeError("Could not obtain scalp surface points from headmodel.")
+
+    # Fallback: if the model is extremely sparse ensure convex hull is used
+    if scalp.shape[0] < 20:
+        hull = ConvexHull(scalp)
+        scalp = scalp[hull.vertices]
 
     # 3) Extract EEG dig points (meters) from raw and run ICP
     eeg_xyz = _get_eeg_points_from_raw(raw)
