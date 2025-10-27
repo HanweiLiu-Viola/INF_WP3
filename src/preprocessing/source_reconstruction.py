@@ -742,7 +742,7 @@ class InverseSolutionComputer:
             data=cov_data,
             names=noise_cov.ch_names,
             bads=noise_cov['bads'],
-            projs=noise_cov['projs'],
+            projs=[],
             nfree=noise_cov['nfree'],
         )
 
@@ -828,7 +828,7 @@ class InverseSolutionComputer:
                 data=cov_data,
                 names=self.noise_cov.ch_names,
                 bads=self.noise_cov['bads'],
-                projs=self.noise_cov['projs'],
+                projs=[],
                 nfree=self.noise_cov['nfree'],
             )
             self.noise_cov_strategy = 'baseline+jitter'
@@ -1201,6 +1201,15 @@ def run_source_reconstruction_pipeline(
     if non_eeg_channels:
         logger.info("  Dropping non-EEG channels: %s", ", ".join(non_eeg_channels))
         epochs_used.pick(eeg_picks)
+
+    if epochs_used.info['projs']:
+        proj_desc = [p.get('desc', 'unnamed') for p in epochs_used.info['projs']]
+        logger.info(
+            "  Removing %d projectors before modelling: %s",
+            len(proj_desc),
+            ", ".join(proj_desc),
+        )
+        epochs_used.del_proj()
 
     bad_channels = find_problematic_channels(epochs_used)
     if bad_channels:
