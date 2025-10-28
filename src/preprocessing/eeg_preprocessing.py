@@ -932,7 +932,8 @@ class EEGPreprocessor:
             self.processing_history.append(f'autoreject_{n_rejected}dropped')
             return epochs_clean, ar, reject_log
     
-    def apply_average_reference(self, raw, ref_channel='REF CZ', copy=True):
+    def apply_average_reference(self, raw, ref_channel='REF CZ', copy=True,
+                                drop_ref_channel=True):
         """
         Apply average reference using 3-step process.
         
@@ -950,6 +951,9 @@ class EEGPreprocessor:
             If None, direct average reference
         copy : bool
             Copy data
+        drop_ref_channel : bool
+            Drop the reference channel after re-referencing. Set to False to
+            retain the physical reference channel in the data.
             
         Returns
         -------
@@ -967,11 +971,14 @@ class EEGPreprocessor:
             logger.info(f"\n[Step 1] Re-reference to {ref_channel}")
             raw.set_eeg_reference(ref_channels=[ref_channel], projection=False)
             logger.info(f"✓ Re-referenced to {ref_channel}")
-            
-            logger.info(f"\n[Step 2] Drop {ref_channel}")
-            raw.drop_channels([ref_channel])
-            logger.info(f"✓ Dropped {ref_channel}")
-            
+
+            if drop_ref_channel:
+                logger.info(f"\n[Step 2] Drop {ref_channel}")
+                raw.drop_channels([ref_channel])
+                logger.info(f"✓ Dropped {ref_channel}")
+            else:
+                logger.info(f"\n[Step 2] Keeping {ref_channel} in the data")
+
             logger.info("\n[Step 3] Average reference")
             raw.set_eeg_reference('average', projection=False)
             logger.info("✓ Applied average reference")
@@ -1002,12 +1009,15 @@ class EEGPreprocessor:
 
 
 def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
-                           interpolate=True, apply_ica=True, 
+                           interpolate=True, apply_ica=True,
                            n_ica_components=None, use_iclabel=True,
                            apply_reference=True, ref_channel='REF CZ',
+                           drop_reference_channel=True,
                            reference_before_ica=True,
                            create_epochs=True, epoch_duration=2.0,
-                           epoch_overlap=0.0, apply_autoreject=True,
+                           epoch_overlap=0.0, epoch_tmin=None,
+                           epoch_tmax=None, epoch_baseline=None,
+                           apply_autoreject=True,
                            autoreject_n_jobs=1, autoreject_reject_mode='drop',
                            **iclabel_kwargs):
     """
@@ -1044,6 +1054,9 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
         Apply average reference (3-step process)
     ref_channel : str or None
         Reference channel name (e.g., 'REF CZ')
+    drop_reference_channel : bool
+        Drop the reference channel after re-referencing. Set to False to keep
+        the reference channel.
     reference_before_ica : bool
         If True, apply reference BEFORE ICA (RECOMMENDED for ICLabel)
         If False, apply reference AFTER ICA (old behavior)
@@ -1054,6 +1067,17 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
         Epoch duration in seconds (default: 2.0)
     epoch_overlap : float
         Overlap between epochs in seconds (default: 0.0)
+    epoch_tmin : float, optional
+        Start time of each epoch in seconds relative to its reference point.
+        If provided together with ``epoch_tmax``, these values will be used to
+        shift the fixed-length epochs so that they span ``epoch_tmin`` to
+        ``epoch_tmax``.
+    epoch_tmax : float, optional
+        End time of each epoch in seconds relative to its reference point.
+        Requires ``epoch_tmin`` to be set.
+    epoch_baseline : tuple | None
+        Baseline correction interval (in seconds) to apply to the epochs. Use
+        the same convention as ``mne.Epochs``.
     apply_autoreject : bool
         Apply Autoreject for automatic epoch cleaning
     autoreject_n_jobs : int
@@ -1153,7 +1177,12 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     if apply_reference and reference_before_ica:
         logger.info("\n[STEP 3] Re-referencing (BEFORE ICA)")
         logger.info("✓ This is the RECOMMENDED approach for ICLabel")
-        raw = preprocessor.apply_average_reference(raw, ref_channel=ref_channel, copy=False)
+        raw = preprocessor.apply_average_reference(
+            raw,
+            ref_channel=ref_channel,
+            copy=False,
+            drop_ref_channel=drop_reference_channel
+        )
     elif not reference_before_ica:
         logger.info("\n[STEP 3] Skipping re-reference (will apply after ICA)")
     else:
@@ -1183,7 +1212,12 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     if apply_reference and not reference_before_ica:
         logger.info("\n[STEP 6] Re-referencing (AFTER ICA)")
         logger.info("Note: For ICLabel, it's better to reference BEFORE ICA")
-        raw = preprocessor.apply_average_reference(raw, ref_channel=ref_channel, copy=False)
+        raw = preprocessor.apply_average_reference(
+            raw,
+            ref_channel=ref_channel,
+            copy=False,
+            drop_ref_channel=drop_reference_channel
+        )
     elif not apply_reference:
         logger.info("\n[STEP 6] Skipping re-reference")
     else:
@@ -1199,10 +1233,32 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     
     if create_epochs:
         logger.info("\n[STEP 7] Creating epochs")
+
+        if epoch_tmin is not None and epoch_tmax is not None:
+            epoch_duration = epoch_tmax - epoch_tmin
+            if epoch_duration <= 0:
+                raise ValueError("epoch_tmax must be greater than epoch_tmin")
+
+            logger.info(
+                f"Using custom epoch window: tmin={epoch_tmin}s, tmax={epoch_tmax}s"
+            )
+        elif (epoch_tmin is None) != (epoch_tmax is None):
+            raise ValueError("Both epoch_tmin and epoch_tmax must be provided together")
+
         epochs = preprocessor.create_fixed_length_epochs(
             raw, duration=epoch_duration, overlap=epoch_overlap, copy=False
         )
-        
+
+        if epoch_tmin is not None and epoch_tmax is not None:
+            epochs = epochs.shift_time(epoch_tmin, relative=True)
+            logger.info(
+                f"Shifted epochs to start at {epochs.tmin:.3f}s and end at {epochs.tmax:.3f}s"
+            )
+
+        if epoch_baseline is not None:
+            logger.info(f"Applying baseline correction: {epoch_baseline}")
+            epochs.apply_baseline(epoch_baseline)
+
         if apply_autoreject:
             logger.info("\n[STEP 8] Autoreject cleaning")
             ar_result = preprocessor.apply_autoreject(

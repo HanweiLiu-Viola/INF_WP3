@@ -21,7 +21,7 @@ import mne
 from scipy.io import loadmat
 import logging
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple, Union, Sequence
 import nibabel as nib
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,48 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # Utility Functions
 # ============================================================
+
+def _channel_variances(
+    epochs: mne.Epochs,
+    picks: Optional[Sequence[int]] = None,
+    use_nanvar: bool = True,
+) -> np.ndarray:
+    """Return per-channel variance across epochs and times."""
+
+    data = epochs.get_data()
+    if picks is None:
+        picks = np.arange(data.shape[1])
+
+    data_sel = data[:, picks, :]
+
+    if use_nanvar:
+        variances = np.nanvar(data_sel, axis=(0, 2))
+    else:
+        variances = np.var(data_sel, axis=(0, 2))
+
+    return variances
+
+
+def find_problematic_channels(
+    epochs: mne.Epochs,
+    picks: Optional[Sequence[int]] = None,
+    variance_floor: float = 1e-14,
+) -> List[str]:
+    """Detect channels that are constant, contain NaNs, or have tiny variance."""
+
+    if picks is None:
+        picks = np.arange(len(epochs.ch_names))
+
+    variances = _channel_variances(epochs, picks=picks)
+
+    bad_mask = ~np.isfinite(variances) | (variances <= variance_floor)
+    if not np.any(bad_mask):
+        return []
+
+    picks_array = np.asarray(picks)
+    bad_indices = picks_array[bad_mask]
+    return [epochs.ch_names[idx] for idx in bad_indices]
+
 
 def validate_electrode_positions(epochs: mne.Epochs) -> Tuple[bool, str]:
     """
@@ -606,12 +648,69 @@ class InverseSolutionComputer:
         self.forward = forward
         self.noise_cov = noise_cov
         self.inverse_operator = None
+        self.noise_cov_strategy: Optional[str] = (
+            'provided' if noise_cov is not None else None
+        )
+        self._forward_fixed = False
+
+    def _convert_forward_to_fixed(self) -> None:
+        """Force the forward solution to use fixed orientations for stability."""
+
+        if self._forward_fixed:
+            return
+
+        try:
+            self.forward = mne.convert_forward_solution(
+                self.forward,
+                force_fixed=True,
+                use_cps=False,
+                copy=True,
+            )
+            self._forward_fixed = True
+            logger.info(
+                "  Converted forward solution to fixed orientations for stability"
+            )
+        except Exception as err:
+            logger.warning(
+                "  Failed to convert forward solution to fixed orientations: %s",
+                err,
+            )
         
+    def _stabilize_covariance_diagonal(
+        self,
+        cov_data: np.ndarray,
+        variance_floor: float = 1e-13,
+    ) -> Tuple[np.ndarray, float]:
+        """Ensure the covariance diagonal is strictly positive and finite."""
+
+        diag = np.diag(cov_data).copy()
+
+        finite_positive = diag[np.isfinite(diag) & (diag > variance_floor)]
+        if finite_positive.size > 0:
+            reference_scale = float(np.median(finite_positive))
+        else:
+            data_variances = _channel_variances(self.epochs)
+            finite_data = data_variances[np.isfinite(data_variances) & (data_variances > 0)]
+            if finite_data.size > 0:
+                reference_scale = float(np.median(finite_data))
+            else:
+                reference_scale = variance_floor
+
+        reference_scale = max(reference_scale, variance_floor)
+
+        needs_fix = (~np.isfinite(diag)) | (diag <= variance_floor)
+        if np.any(needs_fix):
+            diag[needs_fix] = reference_scale
+            cov_data = cov_data.copy()
+            cov_data[np.diag_indices_from(cov_data)] = diag
+
+        return cov_data, reference_scale
+
     def compute_noise_covariance(
         self,
         tmin: Optional[float] = None,
         tmax: float = 0.0,
-        method: str = 'empirical',
+        method: str = 'auto',
         reg: float = 0.1
     ) -> mne.Covariance:
         """
@@ -624,7 +723,8 @@ class InverseSolutionComputer:
         tmax : float
             End time for baseline (default: 0.0)
         method : str
-            Covariance estimation method ('empirical', 'shrunk', etc.)
+            Covariance estimation method passed to
+            :func:`mne.compute_covariance` ('auto', 'empirical', 'oas', etc.)
         reg : float
             Regularization parameter (0 to 1). 
             Adds reg * np.mean(np.diag(cov)) to diagonal for stability.
@@ -637,58 +737,57 @@ class InverseSolutionComputer:
         logger.info("Computing noise covariance from baseline...")
         logger.info(f"  Method: {method}, regularization: {reg}")
         
-        # STEP 1: Compute base covariance
         noise_cov = mne.compute_covariance(
             self.epochs,
             tmin=tmin,
             tmax=tmax,
             method=method,
-            verbose=False
+            verbose=False,
         )
-        
-        # STEP 2: Apply manual regularization if needed
+
+        cov_data = noise_cov.data.copy()
+        cov_data, reference_scale = self._stabilize_covariance_diagonal(cov_data)
+
         if reg > 0:
             logger.info(f"  Applying manual regularization: {reg}")
-            
-            # Get a COPY of the data (can't modify .data directly)
-            cov_data = noise_cov.data.copy()
-            
-            # Calculate regularization amount
+
             diag_mean = np.mean(np.diag(cov_data))
             reg_amount = reg * diag_mean
-            
-            # Add to diagonal
+
+            if not np.isfinite(reg_amount) or reg_amount <= 0:
+                reg_amount = reg * reference_scale
+
             n_channels = cov_data.shape[0]
             cov_data += reg_amount * np.eye(n_channels)
-            
+
             logger.info(f"    Added {reg_amount:.6e} to diagonal")
-            
-            # Create new Covariance object with regularized data
-            self.noise_cov = mne.Covariance(
-                data=cov_data,
-                names=noise_cov.ch_names,
-                bads=noise_cov['bads'],
-                projs=noise_cov['projs'],
-                nfree=noise_cov['nfree']
-            )
-        else:
-            self.noise_cov = noise_cov
-        
+
+        self.noise_cov = mne.Covariance(
+            data=cov_data,
+            names=noise_cov.ch_names,
+            bads=noise_cov['bads'],
+            projs=[],
+            nfree=noise_cov['nfree'],
+        )
+
         logger.info(f"✓ Noise covariance computed")
         logger.info(f"  Shape: {self.noise_cov.data.shape}")
         logger.info(f"  Diagonal mean: {np.diag(self.noise_cov.data).mean():.6e}")
-        
+        logger.info(f"  Smallest variance after stabilisation: {np.diag(self.noise_cov.data).min():.6e}")
+
         # STEP 3: Validate
         if np.any(np.isnan(self.noise_cov.data)) or np.any(np.isinf(self.noise_cov.data)):
             logger.error("❌ Noise covariance contains NaN or Inf!")
             raise ValueError("Noise covariance contains NaN or Inf values!")
-        
+
+        self.noise_cov_strategy = 'baseline'
+
         return self.noise_cov
     
     def make_inverse_operator(
         self,
         loose: float = 0.2,
-        depth: float = 0.8,
+        depth: Optional[float] = None,
         fixed: bool = False
     ) -> mne.minimum_norm.InverseOperator:
         """
@@ -698,8 +797,9 @@ class InverseSolutionComputer:
         ----------
         loose : float
             Loose orientation constraint (0 = fixed, 1 = free)
-        depth : float
-            Depth weighting (0 = no weighting, 1 = full weighting)
+        depth : float or None
+            Depth weighting factor. If ``None`` (default), depth weighting is
+            disabled to improve numerical stability with custom source spaces.
         fixed : bool
             Use fixed orientation
             
@@ -722,11 +822,129 @@ class InverseSolutionComputer:
                 loose=loose,
                 depth=depth,
                 fixed=fixed,
-                verbose=False
+                verbose=False,
             )
-            
+
             logger.info("✓ Inverse operator created")
-            
+
+        except ValueError as e:
+            if "array must not contain infs or NaNs" not in str(e):
+                logger.error(f"❌ Failed to create inverse operator: {e}")
+                logger.error("   This usually means:")
+                logger.error("   1. Noise covariance is too small or unstable")
+                logger.error("   2. Electrode positions/coregistration are wrong")
+                logger.error("   3. Forward solution has numerical issues")
+                raise
+
+            logger.warning(
+                "Inverse operator creation failed due to numerical instability. "
+                "Increasing diagonal regularisation and retrying."
+            )
+
+            cov_data = self.noise_cov.data.copy()
+            trace = np.trace(cov_data)
+            n_ch = cov_data.shape[0]
+            if not np.isfinite(trace) or trace <= 0:
+                trace = 1.0
+            jitter = 1e-12 * trace / float(n_ch)
+            cov_data = cov_data + jitter * np.eye(n_ch)
+
+            self.noise_cov = mne.Covariance(
+                data=cov_data,
+                names=self.noise_cov.ch_names,
+                bads=self.noise_cov['bads'],
+                projs=[],
+                nfree=self.noise_cov['nfree'],
+            )
+            self.noise_cov_strategy = 'baseline+jitter'
+
+            try:
+                self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                    self.epochs.info,
+                    self.forward,
+                    self.noise_cov,
+                    loose=loose,
+                    depth=depth,
+                    fixed=fixed,
+                    verbose=False,
+                )
+                logger.info("✓ Inverse operator created after stabilisation")
+            except ValueError as retry_error:
+                if "array must not contain infs or NaNs" not in str(retry_error):
+                    logger.error(f"❌ Failed to create inverse operator: {retry_error}")
+                    logger.error("   This usually means:")
+                    logger.error("   1. Noise covariance is too small or unstable")
+                    logger.error("   2. Electrode positions/coregistration are wrong")
+                    logger.error("   3. Forward solution has numerical issues")
+                    raise
+
+                self._convert_forward_to_fixed()
+
+                try:
+                    self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                        self.epochs.info,
+                        self.forward,
+                        self.noise_cov,
+                        loose=0.0,
+                        depth=None,
+                        fixed=True,
+                        verbose=False,
+                    )
+                    logger.info(
+                        "✓ Inverse operator created using fixed orientations"
+                    )
+                    return self.inverse_operator
+                except ValueError as retry_fixed_error:
+                    if "array must not contain infs or NaNs" not in str(retry_fixed_error):
+                        logger.error(
+                            f"❌ Failed to create inverse operator: {retry_fixed_error}"
+                        )
+                        logger.error("   This usually means:")
+                        logger.error("   1. Noise covariance is too small or unstable")
+                        logger.error("   2. Electrode positions/coregistration are wrong")
+                        logger.error("   3. Forward solution has numerical issues")
+                        raise
+
+                logger.warning(
+                    "Retrying inverse operator creation with diagonal fallback "
+                    "covariance estimated from channel variances."
+                )
+
+                data_variances = _channel_variances(self.epochs)
+                variance_floor = 1e-13
+                finite = data_variances[np.isfinite(data_variances) & (data_variances > variance_floor)]
+                if finite.size == 0:
+                    reference = variance_floor
+                else:
+                    reference = float(np.median(finite))
+
+                diag = np.clip(data_variances, variance_floor, None)
+                diag[~np.isfinite(diag)] = reference
+
+                cov_data = np.diag(diag)
+                fallback_cov = mne.Covariance(
+                    data=cov_data,
+                    names=self.epochs.ch_names,
+                    bads=[],
+                    projs=[],
+                    nfree=len(self.epochs),
+                )
+
+                self.noise_cov = fallback_cov
+                self.noise_cov_strategy = 'diagonal-variance'
+                self._convert_forward_to_fixed()
+                self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                    self.epochs.info,
+                    self.forward,
+                    self.noise_cov,
+                    loose=0.0,
+                    depth=None,
+                    fixed=True,
+                    verbose=False,
+                )
+                logger.info(
+                    "✓ Inverse operator created using diagonal fallback covariance"
+                )
         except Exception as e:
             logger.error(f"❌ Failed to create inverse operator: {e}")
             logger.error("   This usually means:")
@@ -734,7 +952,7 @@ class InverseSolutionComputer:
             logger.error("   2. Electrode positions/coregistration are wrong")
             logger.error("   3. Forward solution has numerical issues")
             raise
-        
+
         return self.inverse_operator
     
     def apply_inverse(
@@ -871,9 +1089,9 @@ class ROIAnalyzer:
         logger.info("Extracting ROI time series...")
         
         # Get ROI indices from source space
-        if not hasattr(self.src[0], 'roi_indices'):
-            raise ValueError("Source space does not have 'roi_indices' attribute")
-        
+        if 'roi_indices' not in self.src[0]:
+            raise ValueError("Source space does not contain 'roi_indices' metadata")
+
         src_roi_indices = self.src[0]['roi_indices']
         roi_timeseries = {}
         
@@ -911,7 +1129,12 @@ def run_source_reconstruction_pipeline(
     method: str = 'sLORETA',
     lambda2: float = 1.0 / 9.0,
     noise_cov_reg: float = 0.1,
+    noise_cov_method: str = 'auto',
+    noise_cov_tmax: float = 0.0,
     roi_indices: Optional[List[int]] = None,
+    epoch_indices: Optional[Sequence[int]] = None,
+    max_epochs: Optional[int] = 200,
+    random_state: Optional[int] = None,
     n_jobs: int = 1
 ) -> Dict:
     """
@@ -934,8 +1157,22 @@ def run_source_reconstruction_pipeline(
         Regularization parameter (1/SNR^2)
     noise_cov_reg : float
         Noise covariance regularization (0 to 1)
+    noise_cov_method : str
+        Method passed to :func:`mne.compute_covariance` (default ``'auto'``).
+    noise_cov_tmax : float
+        End time (in seconds) for the noise window used to estimate the
+        covariance (default 0.0, i.e., pre-stimulus baseline).
     roi_indices : list of int, optional
         Specific ROI indices to use
+    epoch_indices : sequence of int, optional
+        Explicit epoch indices to use for the inverse solution. If ``None`` the
+        pipeline will automatically subsample when ``max_epochs`` is provided.
+    max_epochs : int, optional
+        Maximum number of epochs to keep for the inverse calculation. ``None``
+        disables subsampling. This helps prevent notebook kernel shutdowns on
+        machines with limited memory.
+    random_state : int, optional
+        Seed used when randomly sub-sampling epochs.
     n_jobs : int
         Number of parallel jobs
         
@@ -951,7 +1188,12 @@ def run_source_reconstruction_pipeline(
         - 'inv': Inverse operator
         - 'trans': Transform used
         - 'atlas': Atlas
+        - 'noise_covariance': Noise covariance matrix used
+        - 'noise_cov_strategy': String describing how the covariance was obtained
         - 'method': Method used
+        - 'epochs_subset': Epochs object actually used in the inverse step
+        - 'epoch_indices': Indices (relative to the original epochs) that were
+          retained
     """
     logger.info("\n" + "="*60)
     logger.info("SOURCE RECONSTRUCTION PIPELINE v2.0")
@@ -966,7 +1208,94 @@ def run_source_reconstruction_pipeline(
         logger.error("Please load 3D coordinates from coordinates.xml before running!")
         raise ValueError(message)
     logger.info(f"  {message}")
-    
+
+    # Step 0b: Select epochs to use (helps prevent OOM in notebooks)
+    n_epochs_total = len(epochs)
+    selection: Optional[np.ndarray]
+    selection = None
+
+    if epoch_indices is not None:
+        selection = np.unique(np.asarray(epoch_indices, dtype=int))
+        selection = selection[(selection >= 0) & (selection < n_epochs_total)]
+        if selection.size == 0:
+            raise ValueError("Provided epoch_indices do not select any epochs.")
+        logger.info(
+            "Using user-provided epoch indices (%d of %d epochs)",
+            selection.size,
+            n_epochs_total,
+        )
+    elif max_epochs is not None and n_epochs_total > max_epochs:
+        rng = np.random.default_rng(random_state)
+        selection = np.sort(rng.choice(n_epochs_total, size=max_epochs, replace=False))
+        logger.info(
+            "Subsampling epochs to avoid memory issues: using %d/%d epochs",
+            selection.size,
+            n_epochs_total,
+        )
+
+    if selection is not None:
+        epochs_used = epochs[selection].copy()
+    else:
+        epochs_used = epochs.copy()
+
+    logger.info("Epochs to process: %d", len(epochs_used))
+
+    logger.info("\n[STEP 0c] Preparing channel list for forward/inverse modelling...")
+    eeg_picks = mne.pick_types(epochs_used.info, eeg=True, exclude=())
+    if eeg_picks.size == 0:
+        raise ValueError("No EEG channels available for source reconstruction.")
+
+    non_eeg_channels = [
+        epochs_used.ch_names[idx]
+        for idx in range(len(epochs_used.ch_names))
+        if idx not in eeg_picks
+    ]
+    epochs_used = epochs_used.copy()
+    if non_eeg_channels:
+        logger.info("  Dropping non-EEG channels: %s", ", ".join(non_eeg_channels))
+        epochs_used.pick(eeg_picks)
+
+    if epochs_used.info['projs']:
+        proj_desc = [p.get('desc', 'unnamed') for p in epochs_used.info['projs']]
+        logger.info(
+            "  Removing %d projectors before modelling: %s",
+            len(proj_desc),
+            ", ".join(proj_desc),
+        )
+        epochs_used.del_proj()
+
+    average_proj_present = any(
+        proj.get('desc', '').lower().startswith('average eeg reference')
+        for proj in epochs_used.info.get('projs', [])
+    )
+
+    if epochs_used.info.get('custom_ref_applied', False):
+        logger.info(
+            "  EEG data marked with custom reference; creating average-reference copy"
+        )
+
+    if epochs_used.info.get('custom_ref_applied', False) or not average_proj_present:
+        epochs_used.load_data()
+        epochs_used_referenced, _ = mne.set_eeg_reference(
+            epochs_used,
+            ref_channels='average',
+            projection=True,
+            ch_type='eeg',
+            copy=True,
+        )
+        epochs_used = epochs_used_referenced
+        logger.info("  Added average reference projector for inverse modelling")
+
+    bad_channels = find_problematic_channels(epochs_used)
+    if bad_channels:
+        logger.warning(
+            "  Removing channels with tiny variance or NaNs: %s",
+            ", ".join(bad_channels),
+        )
+        epochs_used.drop_channels(bad_channels)
+
+    logger.info("  Channels retained for modelling: %d", len(epochs_used.ch_names))
+
     # Step 0.5: Load and validate trans file
     trans = None
     if trans_file is not None:
@@ -1000,18 +1329,22 @@ def run_source_reconstruction_pipeline(
     
     # Step 4: Compute forward solution
     logger.info("\n[STEP 4] Computing forward solution...")
-    fwd_builder = ForwardSolutionBuilder(epochs, src, trans=trans)
+    fwd_builder = ForwardSolutionBuilder(epochs_used, src, trans=trans)
     fwd = fwd_builder.compute_forward(n_jobs=n_jobs)
-    
+
     # Step 5: Compute inverse solution
     logger.info("\n[STEP 5] Computing inverse solution...")
-    inv_computer = InverseSolutionComputer(epochs, fwd)
-    inv_computer.compute_noise_covariance(reg=noise_cov_reg)
+    inv_computer = InverseSolutionComputer(epochs_used, fwd)
+    inv_computer.compute_noise_covariance(
+        reg=noise_cov_reg,
+        method=noise_cov_method,
+        tmax=noise_cov_tmax,
+    )
     inv_computer.make_inverse_operator()
-    
+
     # Apply to average
     stc = inv_computer.apply_inverse(method=method, lambda2=lambda2)
-    
+
     # Apply to individual epochs
     stcs_epochs = inv_computer.apply_inverse_epochs(method=method, lambda2=lambda2)
     
@@ -1043,5 +1376,9 @@ def run_source_reconstruction_pipeline(
         'inv': inv_computer.inverse_operator,
         'trans': trans,
         'atlas': atlas,
-        'method': method
+        'noise_covariance': inv_computer.noise_cov,
+        'noise_cov_strategy': inv_computer.noise_cov_strategy,
+        'method': method,
+        'epochs_subset': epochs_used,
+        'epoch_indices': selection if selection is not None else np.arange(len(epochs_used)),
     }
