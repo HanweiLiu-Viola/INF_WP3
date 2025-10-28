@@ -1089,9 +1089,9 @@ class ROIAnalyzer:
         logger.info("Extracting ROI time series...")
         
         # Get ROI indices from source space
-        if not hasattr(self.src[0], 'roi_indices'):
-            raise ValueError("Source space does not have 'roi_indices' attribute")
-        
+        if 'roi_indices' not in self.src[0]:
+            raise ValueError("Source space does not contain 'roi_indices' metadata")
+
         src_roi_indices = self.src[0]['roi_indices']
         roi_timeseries = {}
         
