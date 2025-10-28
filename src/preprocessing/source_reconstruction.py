@@ -1264,21 +1264,26 @@ def run_source_reconstruction_pipeline(
         )
         epochs_used.del_proj()
 
-    if epochs_used.info.get('custom_ref_applied', False):
-        logger.info("  Clearing custom EEG reference flag for inverse modelling")
-        epochs_used.info['custom_ref_applied'] = False
-
-    if not any(
+    average_proj_present = any(
         proj.get('desc', '').lower().startswith('average eeg reference')
         for proj in epochs_used.info.get('projs', [])
-    ):
-        epochs_used, _ = mne.set_eeg_reference(
+    )
+
+    if epochs_used.info.get('custom_ref_applied', False):
+        logger.info(
+            "  EEG data marked with custom reference; creating average-reference copy"
+        )
+
+    if epochs_used.info.get('custom_ref_applied', False) or not average_proj_present:
+        epochs_used.load_data()
+        epochs_used_referenced, _ = mne.set_eeg_reference(
             epochs_used,
             ref_channels='average',
             projection=True,
             ch_type='eeg',
-            copy=False,
+            copy=True,
         )
+        epochs_used = epochs_used_referenced
         logger.info("  Added average reference projector for inverse modelling")
 
     bad_channels = find_problematic_channels(epochs_used)
