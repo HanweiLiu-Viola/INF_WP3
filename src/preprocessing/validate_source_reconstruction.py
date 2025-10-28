@@ -14,6 +14,31 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.io import loadmat
 
 
+def _ensure_results_dict(results):
+    """Normalize the results input to a dictionary.
+
+    Some callers may provide a lightweight namespace-like object, while
+    others pass a dictionary returned by
+    :func:`run_source_reconstruction_pipeline`.  Converting here keeps the
+    downstream validation code simple and predictable.
+    """
+
+    if results is None:
+        raise ValueError("未提供源重建结果对象")
+
+    if isinstance(results, dict):
+        return results
+
+    # Fallback: try to expose the ``__dict__`` if the user passed a simple
+    # container (e.g. ``SimpleNamespace``).
+    if hasattr(results, "__dict__"):
+        return dict(results.__dict__)
+
+    raise TypeError(
+        "无法识别的结果类型，请提供 run_source_reconstruction_pipeline 的返回字典"
+    )
+
+
 def validate_preparation(
     epochs,
     trans_file=None,
@@ -370,6 +395,215 @@ def validate_preparation(
     print("="*70)
     
     return all_checks_passed
+
+
+# =============================================================================
+# 结果检查
+# =============================================================================
+def validate_results(results, plot=True, max_rois_to_plot=6):
+    """对源重建结果做健康度检查。
+
+    Parameters
+    ----------
+    results : dict or SimpleNamespace
+        ``run_source_reconstruction_pipeline`` 返回的字典或等价对象。
+    plot : bool
+        是否绘制简单的 ROI 平均时间序列以快速检查结果是否合理。
+    max_rois_to_plot : int
+        最多绘制多少个 ROI，以避免在 ROI 很多时生成过大的图像。
+
+    Returns
+    -------
+    bool
+        如果所有关键检查均通过则返回 ``True``，否则返回 ``False``。
+    """
+
+    print("\n" + "=" * 70)
+    print("源重建结果验证工具 v1.0")
+    print("=" * 70)
+
+    checks_passed = True
+    results = _ensure_results_dict(results)
+
+    required_keys = {
+        'stc': "加权平均的源时序 (mne.SourceEstimate)",
+        'stcs_epochs': "逐epoch的源时序列表",
+        'roi_timeseries': "ROI 聚合后的时间序列",
+        'src': "离散源空间定义",
+        'fwd': "正向模型",
+        'inv': "逆算子",
+        'noise_covariance': "噪声协方差"
+    }
+
+    print("\n[检查 1/5] 结果字典关键字段")
+    for key, desc in required_keys.items():
+        if key not in results or results[key] is None:
+            print(f"  ❌ 缺少 {key}: {desc}")
+            checks_passed = False
+        else:
+            print(f"  ✓ {key}: {desc}")
+
+    if not checks_passed:
+        print("\n❌ 结果缺少关键字段，无法继续检查")
+        return False
+
+    stc = results['stc']
+    stcs_epochs = results['stcs_epochs']
+    roi_ts = results['roi_timeseries']
+    src = results['src']
+    fwd = results['fwd']
+    inv = results['inv']
+    noise_cov = results['noise_covariance']
+
+    # 2. STC 基本检查
+    print("\n[检查 2/5] 平均源时序 (stc)")
+    if not isinstance(stc, mne.SourceEstimate):
+        print("  ❌ stc 不是 mne.SourceEstimate 类型")
+        checks_passed = False
+    else:
+        finite_mask = np.isfinite(stc.data)
+        if not finite_mask.all():
+            bad = np.size(stc.data) - np.count_nonzero(finite_mask)
+            print(f"  ❌ stc 包含 {bad} 个 NaN/Inf")
+            checks_passed = False
+        else:
+            print(f"  ✓ 顶点数: {stc.data.shape[0]}, 时间点: {stc.data.shape[1]}")
+            print(f"  ✓ 数据范围: [{stc.data.min():.3e}, {stc.data.max():.3e}]")
+
+    # 3. Epoch 源时序
+    print("\n[检查 3/5] 逐epoch源时序 (stcs_epochs)")
+    if not isinstance(stcs_epochs, (list, tuple)) or len(stcs_epochs) == 0:
+        print("  ❌ stcs_epochs 应为非空列表")
+        checks_passed = False
+    else:
+        bad_epochs = []
+        for idx, epoch_stc in enumerate(stcs_epochs):
+            if not isinstance(epoch_stc, mne.SourceEstimate):
+                bad_epochs.append(idx)
+                continue
+            if epoch_stc.data.shape != stc.data.shape:
+                print(
+                    f"  ⚠️ epoch {idx} 的形状 {epoch_stc.data.shape} "
+                    f"与平均 stc {stc.data.shape} 不一致"
+                )
+            if not np.all(np.isfinite(epoch_stc.data)):
+                bad_epochs.append(idx)
+        if bad_epochs:
+            print(f"  ❌ 以下 epoch 的源时序包含问题: {bad_epochs[:10]}")
+            checks_passed = False
+        else:
+            print(f"  ✓ 共 {len(stcs_epochs)} 个 epoch，数据均为有限值")
+
+    # 4. ROI 时序
+    print("\n[检查 4/5] ROI 时间序列")
+    if not isinstance(roi_ts, dict) or len(roi_ts) == 0:
+        print("  ❌ roi_timeseries 应为非空字典")
+        checks_passed = False
+    else:
+        mismatched = []
+        roi_lengths = set()
+        for name, ts in roi_ts.items():
+            arr = np.asarray(ts)
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]
+            if arr.shape[-1] != stc.data.shape[1]:
+                mismatched.append((name, arr.shape))
+            if not np.all(np.isfinite(arr)):
+                print(f"  ❌ ROI {name} 包含 NaN/Inf")
+                checks_passed = False
+            roi_lengths.add(arr.shape[-1])
+        if mismatched:
+            print("  ❌ 以下 ROI 的时间长度与 stc 不一致:")
+            for name, shape in mismatched[:10]:
+                print(f"    - {name}: shape={shape}")
+            checks_passed = False
+        else:
+            print(f"  ✓ ROI 数量: {len(roi_ts)}，时间长度一致")
+
+    # 5. 元数据: 源空间 / 正向模型 / 协方差
+    print("\n[检查 5/5] 元数据完整性")
+    if not isinstance(src, (list, tuple)):
+        print("  ❌ src 不是 MNE 源空间列表")
+        checks_passed = False
+    else:
+        total_vertices = sum(len(s['vertno']) for s in src)
+        print(f"  ✓ 源空间包含 {len(src)} 个脑区，合计 {total_vertices} 个顶点")
+        if 'roi_indices' in src[0]:
+            unique_rois = np.unique(src[0]['roi_indices'])
+            print(f"  ✓ 检测到 {len(unique_rois)} 个 ROI 索引")
+        else:
+            print("  ⚠️ 源空间缺少 roi_indices 字段，ROI 聚合可能不可用")
+
+    if not isinstance(fwd, dict) or 'sol' not in fwd:
+        print("  ❌ 正向模型对象无效")
+        checks_passed = False
+    else:
+        gain = fwd['sol']['data']
+        finite_gain = np.isfinite(gain)
+        if not finite_gain.all():
+            print("  ❌ 正向模型矩阵包含 NaN/Inf")
+            checks_passed = False
+        else:
+            print(
+                f"  ✓ 正向模型维度: {gain.shape[0]} 通道 × {gain.shape[1]} 自由度"
+            )
+
+    if not isinstance(inv, dict):
+        print("  ❌ 逆算子无效")
+        checks_passed = False
+    else:
+        print("  ✓ 逆算子已生成")
+
+    if not isinstance(noise_cov, mne.Covariance):
+        print("  ❌ noise_covariance 不是 mne.Covariance")
+        checks_passed = False
+    else:
+        if not np.all(np.isfinite(noise_cov.data)):
+            print("  ❌ 噪声协方差包含 NaN/Inf")
+            checks_passed = False
+        else:
+            diag = np.diag(noise_cov.data)
+            min_diag = diag.min()
+            max_diag = diag.max()
+            print(
+                f"  ✓ 噪声协方差对角线范围: [{min_diag:.3e}, {max_diag:.3e}]"
+            )
+
+    # 可选绘图
+    if plot and isinstance(roi_ts, dict) and len(roi_ts) > 0:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            for idx, (name, ts) in enumerate(roi_ts.items()):
+                if idx >= max_rois_to_plot:
+                    break
+                arr = np.asarray(ts)
+                if arr.ndim > 1:
+                    arr = arr.mean(axis=0)
+                ax.plot(stc.times, arr, label=name)
+            ax.set_title("ROI 平均时间序列 (前几个)")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Activity")
+            ax.legend(loc='upper right', fontsize='small')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(
+                '/home/claude/source_reconstruction_roi_preview.png',
+                dpi=150,
+                bbox_inches='tight'
+            )
+            plt.close(fig)
+            print("\n  ✓ ROI 时间序列预览图已保存为 source_reconstruction_roi_preview.png")
+        except Exception as exc:
+            print(f"  ⚠️ ROI 绘图失败: {exc}")
+
+    print("\n" + "=" * 70)
+    if checks_passed:
+        print("✅ 结果检查全部通过")
+    else:
+        print("❌ 结果检查存在问题，请根据提示修复")
+    print("=" * 70)
+
+    return checks_passed
 
 
 # if __name__ == "__main__":
