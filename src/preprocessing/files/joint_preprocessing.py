@@ -384,8 +384,112 @@ class JointPreprocessor:
         logger.info(f"  LFP: {len(lfp_epochs)} epochs")
         
         self.processing_log.append('create_joint_epochs')
-        
+
         return eeg_epochs, lfp_epochs
+
+    @staticmethod
+    def _bad_epoch_indices_from_eeg(eeg_epochs: mne.Epochs) -> np.ndarray:
+        """Infer indices of EEG epochs marked as bad (e.g., by AutoReject)."""
+
+        if hasattr(eeg_epochs, '_bad_epochs_autoreject'):
+            bad_idx = np.asarray(eeg_epochs._bad_epochs_autoreject, dtype=int)
+            bad_idx = bad_idx[(bad_idx >= 0) & (bad_idx < len(eeg_epochs))]
+            return np.unique(bad_idx)
+
+        return np.array([], dtype=int)
+
+    def align_lfp_to_eeg_epochs(
+        self,
+        eeg_epochs: mne.Epochs,
+        lfp_raw: mne.io.Raw,
+        preload: bool = True,
+        drop_bad_from_eeg: bool = True,
+    ) -> Tuple[mne.Epochs, mne.Epochs, np.ndarray, np.ndarray]:
+        """Create LFP epochs aligned to EEG epochs and drop rejected ones.
+
+        Parameters
+        ----------
+        eeg_epochs : mne.Epochs
+            EEG epochs (may contain AutoReject metadata with marked bad epochs).
+        lfp_raw : mne.io.Raw
+            Raw LFP recording to segment using the EEG events.
+        preload : bool
+            Whether to preload the created LFP epochs into memory.
+        drop_bad_from_eeg : bool
+            If ``True`` (default), remove epochs that were marked as bad in the
+            EEG data from both modalities.
+
+        Returns
+        -------
+        eeg_synced : mne.Epochs
+            EEG epochs after optional bad-epoch removal (copy).
+        lfp_synced : mne.Epochs
+            LFP epochs cropped with the same time window and selection.
+        kept_indices : np.ndarray
+            Indices of the original EEG epochs that were retained.
+        dropped_indices : np.ndarray
+            Indices of the EEG epochs that were removed (empty if none).
+        """
+
+        logger.info("根据EEG epochs 创建对齐的LFP epochs...")
+
+        events = eeg_epochs.events
+        if events is None or len(events) == 0:
+            raise ValueError("EEG epochs do not contain events for alignment")
+
+        event_id = eeg_epochs.event_id
+        tmin = eeg_epochs.tmin
+        tmax = eeg_epochs.tmax
+        baseline = eeg_epochs.baseline
+
+        lfp_epochs = mne.Epochs(
+            lfp_raw,
+            events,
+            event_id,
+            tmin=tmin,
+            tmax=tmax,
+            baseline=baseline,
+            preload=preload,
+            verbose=False,
+        )
+
+        if len(lfp_epochs) != len(eeg_epochs):
+            raise ValueError(
+                "LFP epoch count does not match EEG epoch count. Ensure the "
+                "raw LFP data covers the entire EEG recording interval."
+            )
+
+        all_indices = np.arange(len(eeg_epochs))
+        dropped_indices = np.array([], dtype=int)
+
+        if drop_bad_from_eeg:
+            dropped_indices = self._bad_epoch_indices_from_eeg(eeg_epochs)
+
+        kept_mask = np.ones(len(eeg_epochs), dtype=bool)
+        kept_mask[dropped_indices] = False
+        kept_indices = all_indices[kept_mask]
+
+        if kept_indices.size == 0:
+            raise ValueError("All EEG epochs were marked as bad; nothing to align.")
+
+        eeg_synced = eeg_epochs.copy()[kept_indices]
+        lfp_synced = lfp_epochs.copy()[kept_indices]
+
+        logger.info(
+            "✓ LFP epochs 已与EEG对齐: 保留 %d/%d 个epochs",
+            kept_indices.size,
+            len(eeg_epochs),
+        )
+
+        if dropped_indices.size > 0:
+            logger.info(
+                "  丢弃的EEG epochs索引: %s",
+                dropped_indices.tolist(),
+            )
+
+        self.processing_log.append('align_lfp_to_eeg_epochs')
+
+        return eeg_synced, lfp_synced, kept_indices, dropped_indices
     
     def compute_band_power(self, epochs: mne.Epochs,
                           bands: Optional[Dict[str, Tuple]] = None,
