@@ -1,48 +1,70 @@
-# ---- INF_WP3 :: FUNC_Conn ----
-FROM inf_wp3/base:2025-10-09   
+# ===== Base image with conda/mamba =====
+FROM condaforge/mambaforge:23.11.0-0
 
+# Required by you
 USER root
 WORKDIR /workspace
 SHELL ["/bin/bash", "-lc"]
 
-# Java（供 IDTxl 的 JIDT 估计器）
-RUN set -eux; \
-    export DEBIAN_FRONTEND=noninteractive; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends openjdk-17-jdk-headless; \
-    rm -rf /var/lib/apt/lists/*
+# ---- System deps for MNE 2D/3D viz + common tools ----
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential git wget curl ca-certificates \
+    libgl1 libglx-mesa0 libegl1 libglu1-mesa \
+    libxrender1 libsm6 libxext6 libfontconfig1 libglib2.0-0 \
+    libxkbcommon-x11-0 libxcb-xinerama0 libxcb-cursor0 \
+    mesa-utils xvfb xauth libgl1-mesa-dri \
+    ffmpeg graphviz \
+ && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-ENV JDK_HOME=${JAVA_HOME}
-    
-RUN pip list --format=freeze \
-    | sed -e '/^bctpy==/d' \
-          -e '/^snakemake==/d' \
-          -e '/^mne-connectivity==/d' \
-          -e '/^JPype1==/d' \
-          -e '/^pyvista==/d' \
-          -e '/^ipyvtklink==/d' \
-          -e '/^ipywidgets==/d' \
-    > /tmp/base-constraints.txt
+# ---- Faster, stable solver behavior ----
+RUN conda config --system --set channel_priority strict \
+ && conda config --system --add channels conda-forge
 
-# Python Deps（overlay.txt）
-COPY docker/FUNC_Conn/overlay.txt /tmp/overlay.txt
-RUN pip install --no-cache-dir -r /tmp/overlay.txt \
-      -c /tmp/base-constraints.txt \
-      --upgrade-strategy only-if-needed \
- && pip check
+# ---- Create the 'inf' environment (no Octave/FieldTrip) ----
+# NOTE: don't pin mne-icalabel/mne-qt-browser to old versions to avoid solving errors
+RUN mamba create -y -n inf \
+    python=3.10 \
+    mne=1.6.* \
+    mne-qt-browser \
+    mne-icalabel \
+    autoreject=0.4.3 \
+    numpy scipy pandas numba scikit-learn \
+    matplotlib ipympl seaborn \
+    pyvista=0.43.7 pyvistaqt=0.11.1 "vtk>=9.2,<9.3" pyqt \
+    jupyterlab ipywidgets \
+    nibabel nilearn \
+    bids-validator pybids \
+    tqdm joblib \
+ && mamba clean -a -y
 
-# JIDT（供 IDTxl/JIDT 路线使用）
-RUN mkdir -p /opt/jidt && \
-    curl -fsSL -o /opt/jidt/jidt.zip \
-      https://github.com/jlizier/jidt/releases/download/v1.6.1/infodynamics-dist-1.6.1.zip && \
-    unzip -q /opt/jidt/jidt.zip -d /opt/jidt && \
-    ln -sf /opt/jidt/infodynamics-dist-1.6.1/infodynamics.jar /opt/jidt/infodynamics.jar && \
-    rm -f /opt/jidt/jidt.zip
+# (Optional) If you will use automatic IC labeling inference later, uncomment:
+# RUN mamba run -n inf pip install --no-cache-dir onnxruntime
 
-ENV CLASSPATH=/opt/jidt/infodynamics.jar:$CLASSPATH
+# ---- Env vars for 3D backend ----
+ENV MNE_3D_BACKEND=pyvistaqt \
+    PYVISTA_OFF_SCREEN=false \
+    PYTHONUNBUFFERED=1
 
-# 3D Backend
-ENV MNE_3D_BACKEND=trame
-ENV PYVISTA_JUPYTER_BACKEND=1
+# ---- Sanity check (no 'conda activate' needed) ----
+RUN mamba run -n inf python - <<'PY'
+import mne, pyvista, pyvistaqt, vtk, matplotlib, sys
+print("MNE:", mne.__version__)
+print("PyVista:", pyvista.__version__)
+print("PyVistaQt:", pyvistaqt.__version__)
+print("VTK:", vtk.__version__, "Python:", sys.version)
+PY
+
+# ---- Copy project last to maximize cache reuse ----
+COPY . /workspace
+
+EXPOSE 8888
+
+# ---- Default command: headless 3D via Xvfb + JupyterLab ----
+CMD bash -lc '\
+  mamba run -n inf \
+  xvfb-run -s "-screen 0 1920x1080x24" \
+  jupyter lab --ip=0.0.0.0 --no-browser --allow-root \
+  --NotebookApp.token="" --NotebookApp.password="" \
+'
+
 

@@ -43,8 +43,8 @@ class EEGPreprocessor:
         raw : mne.io.Raw
             Raw EEG data
         ransac : bool
-            DEPRECATED: Keep as False (RANSAC has channel position issues)
-            Using correlation + deviation + HF noise is sufficient
+            True: try RANSAC method, if it fails, a warning will be issued and the process will automatically skip. (RANSAC has channel position issues)
+            Using other methods: correlation + deviation + HF noise only.
             
         Returns
         -------
@@ -101,13 +101,11 @@ class EEGPreprocessor:
         
         logger.info(f"Channels for pyprep: {len(raw_eeg.ch_names)}")
         
-        # RANSAC warning
+
         if ransac:
-            logger.warning("RANSAC disabled due to channel position issues")
-            logger.warning("Using correlation + deviation + HF noise instead")
-            ransac = False
-        
-        logger.info(f"Detection methods: correlation, deviation, HF noise")
+            logger.info(f"Detection methods: correlation, deviation, HF noise, RANSAC")
+        else:
+            logger.info(f"Detection methods: correlation, deviation, HF noise")
         
         # Run pyprep detection
         nc = NoisyChannels(raw_eeg, do_detrend=False)
@@ -121,10 +119,21 @@ class EEGPreprocessor:
         logger.info("[3] HF noise detection...")
         nc.find_bad_by_hfnoise()
         
-        # Skip RANSAC to avoid index errors
-        logger.info("[4] RANSAC: skipped (not needed for filtered channels)")
+                
+        if ransac:
+            logger.info("[4] RANSAC detection...")
+            try:
+                nc.find_bad_by_ransac()
+            except Exception as e:
+                logger.warning(f"RANSAC failed: {e}")               
+                logger.warning("Using correlation + deviation + HF noise instead")
+                ransac = False
+        else:
+            # Skip RANSAC to avoid index errors
+            logger.info("[4] RANSAC: skipped (not needed for filtered channels)")
         
         bad_channels = nc.get_bads()
+        bad_channels = [str(ch) for ch in bad_channels]
         
         logger.info("\n" + "="*60)
         logger.info("DETECTION RESULTS")
@@ -146,6 +155,9 @@ class EEGPreprocessor:
                 logger.info(f"  HF noise: {nc.bad_by_hfnoise}")
             elif hasattr(nc, 'bad_by_hf_noise') and nc.bad_by_hf_noise:
                 logger.info(f"  HF noise: {nc.bad_by_hf_noise}")
+
+            if ransac and hasattr(nc, 'bad_by_ransac') and nc.bad_by_ransac:
+                logger.info(f"  RANSAC: {nc.bad_by_ransac}")
         else:
             logger.info("No bad channels detected - all channels look good!")
         
@@ -154,8 +166,31 @@ class EEGPreprocessor:
         return bad_channels
     
     def mark_bad_channels(self, raw, bad_channels=None, method='pyprep', 
-                         ransac=True, copy=True):
-        """Mark bad channels in raw data"""
+                         ransac=False, copy=True):
+        """
+        Mark bad channels in raw data
+
+        Parameters
+        ----------
+        raw : mne.io.Raw
+            Raw EEG data
+        bad_channels : list, optional
+            List of bad channel names to mark. If None, will detect using specified method.
+        method : str
+            Method to detect bad channels if bad_channels is None. Default: 'pyprep'
+        ransac : bool
+            True: try RANSAC method, if it fails, a warning will be issued and the process will automatically skip. (RANSAC has channel position issues)
+            Using other methods: correlation + deviation + HF noise only.
+        copy : bool
+            If True, operate on a copy of raw data.
+        Returns
+        -------
+        raw : mne.io.Raw
+            Raw data with bad channels marked in raw.info['bads']
+        bad_channels : list
+            List of bad channel names
+            
+        """
         if copy:
             raw = raw.copy()
         
@@ -203,7 +238,30 @@ class EEGPreprocessor:
     
     def apply_ica(self, raw, n_components=None, method='fastica',
                   random_state=42, copy=True):
-        """Apply ICA"""
+        """
+        Apply ICA
+        
+        Parameters
+        ----------
+        raw : mne.io.Raw
+            Raw EEG data
+        n_components : int, optional
+            Number of ICA components to compute. If None, uses min(n_channels, n_times // 2).
+        method : 'fastica' | 'infomax' | 'picard' 
+            ICA method. Default: 'fastica'
+        random_state : int
+            Random state for reproducibility
+        copy : bool
+            If True, operate on a copy of raw data. 
+
+        Returns 
+        -------
+        raw : mne.io.Raw
+            Raw data (unchanged)
+        ica : mne.preprocessing.ICA
+            Fitted ICA object
+
+        """
         if copy:
             raw = raw.copy()
         
@@ -229,7 +287,17 @@ class EEGPreprocessor:
         
         logger.info(f"✓ Fitted {ica.n_components_} components")
         self.processing_history.append(f'ica_{n_components}')
-        
+
+        # ---- ① 所有组件对各类通道解释的总方差 ----
+        try:
+            explained_var_ratio = ica.get_explained_variance_ratio(raw)
+            for ch_type, ratio in explained_var_ratio.items():
+                logger.info(
+                    f"Fraction of {ch_type} variance explained by all components: {ratio:.3f} ({ratio * 100:.1f}%)"                    
+                )
+        except Exception as e:
+            logger.warning(f"Could not compute explained variance ratio (all components): {e!r}")
+                    
         return raw, ica
     
     def classify_ica_components_iclabel(self, ica, raw):
@@ -273,8 +341,6 @@ class EEGPreprocessor:
         logger.info("\n" + "="*60)
         logger.info("CLASSIFYING ICA COMPONENTS WITH ICLabel")
         logger.info("="*60)
-        logger.info("Note: This method does NOT require EOG/ECG channels")
-        logger.info("      It works with pure EEG data using learned patterns")
         
         # Run ICLabel classification
         logger.info("\n[1] Running ICLabel neural network classifier...")
@@ -610,7 +676,6 @@ class EEGPreprocessor:
         # METHOD 1: ICLabel (recommended for data without EOG/ECG)
         if use_iclabel:
             logger.info("Method: ICLabel automatic classification")
-            logger.info("  (Does not require EOG/ECG channels)")
             
             # Classify components
             labels_pred, labels_pred_proba, label_names = \
@@ -933,7 +998,7 @@ class EEGPreprocessor:
             return epochs_clean, ar, reject_log
     
     def apply_average_reference(self, raw, ref_channel='REF CZ', copy=True,
-                                drop_ref_channel=True):
+                                set_ref_channel=True):
         """
         Apply average reference using 3-step process.
         
@@ -951,8 +1016,8 @@ class EEGPreprocessor:
             If None, direct average reference
         copy : bool
             Copy data
-        drop_ref_channel : bool
-            Drop the reference channel after re-referencing. Set to False to
+        set_ref_channel : bool
+            Set the reference channel as 'misc'. Set to False to
             retain the physical reference channel in the data.
             
         Returns
@@ -969,18 +1034,19 @@ class EEGPreprocessor:
         
         if ref_channel is not None and ref_channel in raw.ch_names:
             logger.info(f"\n[Step 1] Re-reference to {ref_channel}")
-            raw.set_eeg_reference(ref_channels=[ref_channel], projection=False)
+            raw.set_eeg_reference(ref_channels=[ref_channel], projection=False)      # 重新参考到 REF CZ
+
             logger.info(f"✓ Re-referenced to {ref_channel}")
 
-            if drop_ref_channel:
-                logger.info(f"\n[Step 2] Drop {ref_channel}")
-                raw.drop_channels([ref_channel])
-                logger.info(f"✓ Dropped {ref_channel}")
+            if  set_ref_channel:
+                logger.info(f"\n[Step 2] Set {ref_channel} as 'misc'")
+                raw.set_channel_types({ref_channel: 'misc'})
+                logger.info(f"✓ {ref_channel} has been set to 'misc'")
             else:
                 logger.info(f"\n[Step 2] Keeping {ref_channel} in the data")
 
             logger.info("\n[Step 3] Average reference")
-            raw.set_eeg_reference('average', projection=False)
+            raw.set_eeg_reference('average', projection=True)
             logger.info("✓ Applied average reference")
             
             self.processing_history.append(f'avg_ref_via_{ref_channel}')
@@ -989,11 +1055,12 @@ class EEGPreprocessor:
                 logger.warning(f"'{ref_channel}' not found, using direct average")
             
             logger.info("Direct average reference")
-            raw.set_eeg_reference('average', projection=False)
+            raw.set_eeg_reference('average', projection=True)
             logger.info("✓ Applied average reference")
             
             self.processing_history.append('avg_ref_direct')
         
+        raw.apply_proj()    # 应用投影器 
         logger.info("="*60)
         
         return raw

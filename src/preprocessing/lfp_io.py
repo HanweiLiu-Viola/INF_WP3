@@ -466,31 +466,50 @@ def compute_spectrogram(df_ts_sense, df_settings):
 # Stimulation Alignment Functions
 # ============================================================
 
-def align_stim_to_sense(df_ts_stim, df_ts_sense):
+def align_stim_to_sense(df_ts_stim, df_ts_sense, offset_ms=250):
     """
-    Align stimulation data to sensing data timeline.
-    
+    Align and upsample low-frequency stimulation signals (df_ts_stim)
+    to match the high-frequency sensing signals (df_ts_sense).
+    This function:
+    1. Corrects the stimulation timestamp offset (default: stim is delayed by 250 ms).
+    2. Performs zero-order hold interpolation (forward-fill) to upsample the 
+       stimulation data to match the sensing time axis (e.g., 2 Hz → 250 Hz).
+    3. Joins both signals into a single DataFrame aligned on the sense index.
+
     Parameters
     ----------
     df_ts_stim : pd.DataFrame
         Stimulation amplitudes with sparse timestamps
     df_ts_sense : pd.DataFrame
         Sensing voltage data with dense timestamps
+
+    offset_ms : int, optional (default=250)
+        Time offset in milliseconds by which the stimulation timestamps lag behind 
+        the sensing timestamps. The stimulation timestamps are shifted backward
+        by this amount to synchronize the starting points.
         
     Returns
     -------
-    pd.DataFrame
-        Stimulation data aligned to sensing timeline
+    df_merged : pandas.DataFrame
+        A DataFrame containing both sensing and aligned stimulation signals,
+        sharing the same time index (the sense index). Missing values (before 
+        the first stimulation sample) are filled with zeros.
     """
-    # Reindex stimulation data to match sensing data timeline
-    # Use forward fill to propagate stimulation values between timestamps
-    df_ts_stim_aligned = df_ts_stim.reindex(
-        df_ts_sense.index, 
-        method='ffill'
+    # 1. Shift stimulation timestamps backward by the known offset
+    df_stim_shifted = df_ts_stim.copy()
+    df_stim_shifted.index = df_stim_shifted.index - pd.Timedelta(milliseconds=offset_ms)
+
+    # 2. Reindex stimulation to match sense timestamps (upsampling)
+    df_stim_upsampled = df_stim_shifted.reindex(
+        index=df_ts_sense.index,
+        method='ffill'         # zero-order hold
     )
-    
-    # Fill any leading NaN values with 0 (stim off)
-    df_ts_stim_aligned = df_ts_stim_aligned.fillna(0)
+
+    # 3. For times before the first stim sample, fill with zeros
+    df_ts_stim_aligned = df_stim_upsampled.fillna(0.0)
+
+    # 4. Merge sensing and stimulation into one DataFrame
+    # df_merged = df_ts_sense.join(df_ts_stim_aligned, how='left')
     
     return df_ts_stim_aligned
 

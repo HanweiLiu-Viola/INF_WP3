@@ -215,7 +215,7 @@ def save_eeg_bids(eeg_segment, subject_id, bids_root, deriv_eeg_dir,
     
     # Add custom metadata
     print(f"\n[5] Adding custom metadata...")
-    json_bids_path = bids_path.copy().update(extension='.json')
+    json_bids_path = bids_path.copy().update(suffix='eeg', extension='.json')
     json_path = Path(str(json_bids_path.fpath))
     
     with open(str(json_path), 'r') as f:

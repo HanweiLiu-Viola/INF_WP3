@@ -651,6 +651,30 @@ class InverseSolutionComputer:
         self.noise_cov_strategy: Optional[str] = (
             'provided' if noise_cov is not None else None
         )
+        self._forward_fixed = False
+
+    def _convert_forward_to_fixed(self) -> None:
+        """Force the forward solution to use fixed orientations for stability."""
+
+        if self._forward_fixed:
+            return
+
+        try:
+            self.forward = mne.convert_forward_solution(
+                self.forward,
+                force_fixed=True,
+                use_cps=False,
+                copy=True,
+            )
+            self._forward_fixed = True
+            logger.info(
+                "  Converted forward solution to fixed orientations for stability"
+            )
+        except Exception as err:
+            logger.warning(
+                "  Failed to convert forward solution to fixed orientations: %s",
+                err,
+            )
         
     def _stabilize_covariance_diagonal(
         self,
@@ -763,7 +787,7 @@ class InverseSolutionComputer:
     def make_inverse_operator(
         self,
         loose: float = 0.2,
-        depth: float = 0.8,
+        depth: Optional[float] = None,
         fixed: bool = False
     ) -> mne.minimum_norm.InverseOperator:
         """
@@ -773,8 +797,9 @@ class InverseSolutionComputer:
         ----------
         loose : float
             Loose orientation constraint (0 = fixed, 1 = free)
-        depth : float
-            Depth weighting (0 = no weighting, 1 = full weighting)
+        depth : float or None
+            Depth weighting factor. If ``None`` (default), depth weighting is
+            disabled to improve numerical stability with custom source spaces.
         fixed : bool
             Use fixed orientation
             
@@ -853,6 +878,33 @@ class InverseSolutionComputer:
                     logger.error("   3. Forward solution has numerical issues")
                     raise
 
+                self._convert_forward_to_fixed()
+
+                try:
+                    self.inverse_operator = mne.minimum_norm.make_inverse_operator(
+                        self.epochs.info,
+                        self.forward,
+                        self.noise_cov,
+                        loose=0.0,
+                        depth=None,
+                        fixed=True,
+                        verbose=False,
+                    )
+                    logger.info(
+                        "✓ Inverse operator created using fixed orientations"
+                    )
+                    return self.inverse_operator
+                except ValueError as retry_fixed_error:
+                    if "array must not contain infs or NaNs" not in str(retry_fixed_error):
+                        logger.error(
+                            f"❌ Failed to create inverse operator: {retry_fixed_error}"
+                        )
+                        logger.error("   This usually means:")
+                        logger.error("   1. Noise covariance is too small or unstable")
+                        logger.error("   2. Electrode positions/coregistration are wrong")
+                        logger.error("   3. Forward solution has numerical issues")
+                        raise
+
                 logger.warning(
                     "Retrying inverse operator creation with diagonal fallback "
                     "covariance estimated from channel variances."
@@ -880,13 +932,14 @@ class InverseSolutionComputer:
 
                 self.noise_cov = fallback_cov
                 self.noise_cov_strategy = 'diagonal-variance'
+                self._convert_forward_to_fixed()
                 self.inverse_operator = mne.minimum_norm.make_inverse_operator(
                     self.epochs.info,
                     self.forward,
                     self.noise_cov,
-                    loose=loose,
-                    depth=depth,
-                    fixed=fixed,
+                    loose=0.0,
+                    depth=None,
+                    fixed=True,
                     verbose=False,
                 )
                 logger.info(
@@ -1036,9 +1089,9 @@ class ROIAnalyzer:
         logger.info("Extracting ROI time series...")
         
         # Get ROI indices from source space
-        if not hasattr(self.src[0], 'roi_indices'):
-            raise ValueError("Source space does not have 'roi_indices' attribute")
-        
+        if 'roi_indices' not in self.src[0]:
+            raise ValueError("Source space does not contain 'roi_indices' metadata")
+
         src_roi_indices = self.src[0]['roi_indices']
         roi_timeseries = {}
         
@@ -1210,6 +1263,28 @@ def run_source_reconstruction_pipeline(
             ", ".join(proj_desc),
         )
         epochs_used.del_proj()
+
+    average_proj_present = any(
+        proj.get('desc', '').lower().startswith('average eeg reference')
+        for proj in epochs_used.info.get('projs', [])
+    )
+
+    if epochs_used.info.get('custom_ref_applied', False):
+        logger.info(
+            "  EEG data marked with custom reference; creating average-reference copy"
+        )
+
+    if epochs_used.info.get('custom_ref_applied', False) or not average_proj_present:
+        epochs_used.load_data()
+        epochs_used_referenced, _ = mne.set_eeg_reference(
+            epochs_used,
+            ref_channels='average',
+            projection=True,
+            ch_type='eeg',
+            copy=True,
+        )
+        epochs_used = epochs_used_referenced
+        logger.info("  Added average reference projector for inverse modelling")
 
     bad_channels = find_problematic_channels(epochs_used)
     if bad_channels:

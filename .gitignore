@@ -7,6 +7,7 @@ __pycache__/
 .env
 
 # Data & results
+shared/
 shared/data/
 shared/results/
 shared/tmp/

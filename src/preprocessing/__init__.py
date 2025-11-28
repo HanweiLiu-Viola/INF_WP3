@@ -24,10 +24,13 @@ from .align_headmodel import make_trans_from_coordinates
 from .data_io import BIDSDataLoader, BIDSDataSaver
 from .data_validation import DataValidator
 from .signal_cleaning import SignalCleaner, EEGCleaner, LFPCleaner
-from .eeg_preprocessing import EEGPreprocessor
+from .eeg_preprocessing_v2 import EEGPreprocessor
 from .lfp_preprocessing import LFPPreprocessor
 from .joint_preprocessing import JointPreprocessor
 from .quality_control import QualityControl, BIDSDerivativesSaver
+# from .eeg_preprocessing import EEGPreprocessor, preprocess_eeg_complete
+
+
 
 
 __all__ = [
