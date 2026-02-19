@@ -74,18 +74,3 @@ INF_WP3/
   .env.example                 # environment variables template
   .gitignore
 ```
-
----
-
-## GPT Interface (stub)
-
-- `agent/main.py "中文或英文问题…" `
-- Produces a **plan** and executes mapped commands (e.g., Snakemake targets, Python scripts).
-- You can later connect this to an external GPT endpoint; see `agent/README.md`.
-
----
-
-## HPC
-
-- Example **SLURM** profile at `config/profiles/hpc/slurm/`.
-- Run with: `snakemake --profile config/profiles/hpc/slurm` inside the container.
