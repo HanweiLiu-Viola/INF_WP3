@@ -43,8 +43,8 @@ class EEGPreprocessor:
         raw : mne.io.Raw
             Raw EEG data
         ransac : bool
-            True: try RANSAC method, if it fails, a warning will be issued and the process will automatically skip. (RANSAC has channel position issues)
-            Using other methods: correlation + deviation + HF noise only.
+            DEPRECATED: Keep as False (RANSAC has channel position issues)
+            Using correlation + deviation + HF noise is sufficient
             
         Returns
         -------
@@ -101,11 +101,13 @@ class EEGPreprocessor:
         
         logger.info(f"Channels for pyprep: {len(raw_eeg.ch_names)}")
         
-
+        # RANSAC warning
         if ransac:
-            logger.info(f"Detection methods: correlation, deviation, HF noise, RANSAC")
-        else:
-            logger.info(f"Detection methods: correlation, deviation, HF noise")
+            logger.warning("RANSAC disabled due to channel position issues")
+            logger.warning("Using correlation + deviation + HF noise instead")
+            ransac = False
+        
+        logger.info(f"Detection methods: correlation, deviation, HF noise")
         
         # Run pyprep detection
         nc = NoisyChannels(raw_eeg, do_detrend=False)
@@ -119,21 +121,10 @@ class EEGPreprocessor:
         logger.info("[3] HF noise detection...")
         nc.find_bad_by_hfnoise()
         
-                
-        if ransac:
-            logger.info("[4] RANSAC detection...")
-            try:
-                nc.find_bad_by_ransac()
-            except Exception as e:
-                logger.warning(f"RANSAC failed: {e}")               
-                logger.warning("Using correlation + deviation + HF noise instead")
-                ransac = False
-        else:
-            # Skip RANSAC to avoid index errors
-            logger.info("[4] RANSAC: skipped (not needed for filtered channels)")
+        # Skip RANSAC to avoid index errors
+        logger.info("[4] RANSAC: skipped (not needed for filtered channels)")
         
         bad_channels = nc.get_bads()
-        bad_channels = [str(ch) for ch in bad_channels]
         
         logger.info("\n" + "="*60)
         logger.info("DETECTION RESULTS")
@@ -155,9 +146,6 @@ class EEGPreprocessor:
                 logger.info(f"  HF noise: {nc.bad_by_hfnoise}")
             elif hasattr(nc, 'bad_by_hf_noise') and nc.bad_by_hf_noise:
                 logger.info(f"  HF noise: {nc.bad_by_hf_noise}")
-
-            if ransac and hasattr(nc, 'bad_by_ransac') and nc.bad_by_ransac:
-                logger.info(f"  RANSAC: {nc.bad_by_ransac}")
         else:
             logger.info("No bad channels detected - all channels look good!")
         
@@ -166,31 +154,8 @@ class EEGPreprocessor:
         return bad_channels
     
     def mark_bad_channels(self, raw, bad_channels=None, method='pyprep', 
-                         ransac=False, copy=True):
-        """
-        Mark bad channels in raw data
-
-        Parameters
-        ----------
-        raw : mne.io.Raw
-            Raw EEG data
-        bad_channels : list, optional
-            List of bad channel names to mark. If None, will detect using specified method.
-        method : str
-            Method to detect bad channels if bad_channels is None. Default: 'pyprep'
-        ransac : bool
-            True: try RANSAC method, if it fails, a warning will be issued and the process will automatically skip. (RANSAC has channel position issues)
-            Using other methods: correlation + deviation + HF noise only.
-        copy : bool
-            If True, operate on a copy of raw data.
-        Returns
-        -------
-        raw : mne.io.Raw
-            Raw data with bad channels marked in raw.info['bads']
-        bad_channels : list
-            List of bad channel names
-            
-        """
+                         ransac=True, copy=True):
+        """Mark bad channels in raw data"""
         if copy:
             raw = raw.copy()
         
@@ -231,37 +196,14 @@ class EEGPreprocessor:
         
         n = len(self.bad_channels)
         self.processing_history.append(f'interpolated_{n}')
-        logger.info(f"✓ Interpolated {n} channels")
+        logger.info(f"âœ“ Interpolated {n} channels")
         logger.info("="*60)
         
         return raw
     
-    def apply_ica(self, raw, n_components=None, method='fastica',
+    def apply_ica(self, raw, n_components=None, method='infomax',
                   random_state=42, copy=True):
-        """
-        Apply ICA
-        
-        Parameters
-        ----------
-        raw : mne.io.Raw
-            Raw EEG data
-        n_components : int, optional
-            Number of ICA components to compute. If None, uses min(n_channels, n_times // 2).
-        method : 'fastica' | 'infomax' | 'picard' 
-            ICA method. Default: 'fastica'
-        random_state : int
-            Random state for reproducibility
-        copy : bool
-            If True, operate on a copy of raw data. 
-
-        Returns 
-        -------
-        raw : mne.io.Raw
-            Raw data (unchanged)
-        ica : mne.preprocessing.ICA
-            Fitted ICA object
-
-        """
+        """Apply ICA"""
         if copy:
             raw = raw.copy()
         
@@ -278,6 +220,7 @@ class EEGPreprocessor:
         ica = mne.preprocessing.ICA(
             n_components=n_components,
             method=method,
+            fit_params=dict(extended=True),
             random_state=random_state,
             max_iter='auto'
         )
@@ -285,19 +228,9 @@ class EEGPreprocessor:
         logger.info("Fitting ICA...")
         ica.fit(raw)
         
-        logger.info(f"✓ Fitted {ica.n_components_} components")
+        logger.info(f"âœ“ Fitted {ica.n_components_} components")
         self.processing_history.append(f'ica_{n_components}')
-
-        # ---- ① 所有组件对各类通道解释的总方差 ----
-        try:
-            explained_var_ratio = ica.get_explained_variance_ratio(raw)
-            for ch_type, ratio in explained_var_ratio.items():
-                logger.info(
-                    f"Fraction of {ch_type} variance explained by all components: {ratio:.3f} ({ratio * 100:.1f}%)"                    
-                )
-        except Exception as e:
-            logger.warning(f"Could not compute explained variance ratio (all components): {e!r}")
-                    
+        
         return raw, ica
     
     def classify_ica_components_iclabel(self, ica, raw):
@@ -326,7 +259,7 @@ class EEGPreprocessor:
         labels_pred : np.ndarray
             Predicted labels for each component (0-6)
         labels_pred_proba : np.ndarray
-            Probability matrix (n_components × 7)
+            Probability matrix (n_components Ã— 7)
         label_names : list
             Category names
         """
@@ -341,6 +274,8 @@ class EEGPreprocessor:
         logger.info("\n" + "="*60)
         logger.info("CLASSIFYING ICA COMPONENTS WITH ICLabel")
         logger.info("="*60)
+        logger.info("Note: This method does NOT require EOG/ECG channels")
+        logger.info("      It works with pure EEG data using learned patterns")
         
         # Run ICLabel classification
         logger.info("\n[1] Running ICLabel neural network classifier...")
@@ -369,11 +304,11 @@ class EEGPreprocessor:
                 # Flattened 2D matrix - reshape it
                 logger.info("Detected flattened probability matrix - reshaping...")
                 labels_pred_proba = labels_pred_proba.reshape(n_components, len(label_names))
-                logger.info(f"✓ Reshaped to: {labels_pred_proba.shape}")
+                logger.info(f"âœ“ Reshaped to: {labels_pred_proba.shape}")
             elif len(labels_pred_proba) == n_components:
                 # Max probabilities only (new format)
                 logger.info("Detected 1D max probabilities (new mne-icalabel format)")
-                logger.info("✓ Will use labels_pred directly for component selection")
+                logger.info("âœ“ Will use labels_pred directly for component selection")
                 logger.info("  (This is the correct behavior for newer versions)")
                 
                 # Store as 1D - we'll handle this in select_ica_components_by_label
@@ -676,6 +611,7 @@ class EEGPreprocessor:
         # METHOD 1: ICLabel (recommended for data without EOG/ECG)
         if use_iclabel:
             logger.info("Method: ICLabel automatic classification")
+            logger.info("  (Does not require EOG/ECG channels)")
             
             # Classify components
             labels_pred, labels_pred_proba, label_names = \
@@ -698,9 +634,9 @@ class EEGPreprocessor:
                     eog_idx, _ = ica.find_bads_eog(raw, threshold=3.0)
                     exclude_idx.extend(eog_idx)
                     if eog_idx:
-                        logger.info(f"✓ Found {len(eog_idx)} EOG: {eog_idx}")
+                        logger.info(f"âœ“ Found {len(eog_idx)} EOG: {eog_idx}")
                     else:
-                        logger.info("✓ No EOG components")
+                        logger.info("âœ“ No EOG components")
                 except Exception as e:
                     logger.warning(f"EOG detection failed: {e}")
             
@@ -710,9 +646,9 @@ class EEGPreprocessor:
                     ecg_idx, _ = ica.find_bads_ecg(raw, threshold=3.0)
                     exclude_idx.extend(ecg_idx)
                     if ecg_idx:
-                        logger.info(f"✓ Found {len(ecg_idx)} ECG: {ecg_idx}")
+                        logger.info(f"âœ“ Found {len(ecg_idx)} ECG: {ecg_idx}")
                     else:
-                        logger.info("✓ No ECG components")
+                        logger.info("âœ“ No ECG components")
                 except Exception as e:
                     logger.warning(f"ECG detection failed: {e}")
             
@@ -776,7 +712,7 @@ class EEGPreprocessor:
             raw = ica.apply(raw)
             
             self.processing_history.append(f'removed_{len(exclude_idx)}_ica')
-            logger.info(f"✓ Removed {len(exclude_idx)} components")
+            logger.info(f"âœ“ Removed {len(exclude_idx)} components")
             logger.info("="*60)
         else:
             logger.info("No components to remove")
@@ -828,7 +764,7 @@ class EEGPreprocessor:
         )
         
         n_epochs = len(epochs)
-        logger.info(f"✓ Created {n_epochs} epochs")
+        logger.info(f"âœ“ Created {n_epochs} epochs")
         
         # Apply rejection criteria if provided
         if reject is not None or flat is not None:
@@ -843,8 +779,8 @@ class EEGPreprocessor:
             epochs_after = len(epochs)
             
             n_dropped = epochs_before - epochs_after
-            logger.info(f"✓ Dropped {n_dropped} bad epochs")
-            logger.info(f"✓ Remaining: {epochs_after} epochs")
+            logger.info(f"âœ“ Dropped {n_dropped} bad epochs")
+            logger.info(f"âœ“ Remaining: {epochs_after} epochs")
         
         self.processing_history.append(f'epochs_{duration}s_{len(epochs)}')
         logger.info("="*60)
@@ -934,7 +870,7 @@ class EEGPreprocessor:
         )
         
         ar.fit(epochs)
-        logger.info("✓ AutoReject fitted")
+        logger.info("âœ“ AutoReject fitted")
         
         # Apply cleaning
         logger.info("\n[2] Applying cleaning...")
@@ -971,8 +907,8 @@ class EEGPreprocessor:
             epochs_all._bad_epochs_autoreject = bad_epochs_idx
             epochs_all._autoreject_log = reject_log
             
-            logger.info(f"✓ All {n_total} epochs retained with {n_rejected} marked as bad")
-            logger.info(f"✓ Bad epochs stored in: epochs._bad_epochs_autoreject")
+            logger.info(f"âœ“ All {n_total} epochs retained with {n_rejected} marked as bad")
+            logger.info(f"âœ“ Bad epochs stored in: epochs._bad_epochs_autoreject")
             logger.info("="*60)
             
             self.processing_history.append(f'autoreject_{n_rejected}marked')
@@ -981,8 +917,8 @@ class EEGPreprocessor:
         elif reject_mode == 'return_all':
             # Return both clean epochs and full info
             logger.info("\nMode: RETURN_ALL - Returning clean epochs + bad indices")
-            logger.info(f"✓ Clean epochs: {n_clean}")
-            logger.info(f"✓ Bad epoch indices saved for reference")
+            logger.info(f"âœ“ Clean epochs: {n_clean}")
+            logger.info(f"âœ“ Bad epoch indices saved for reference")
             logger.info("="*60)
             
             self.processing_history.append(f'autoreject_{n_rejected}dropped')
@@ -991,20 +927,20 @@ class EEGPreprocessor:
         else:  # reject_mode == 'drop' (default)
             # Drop bad epochs (default behavior)
             logger.info("\nMode: DROP - Removing bad epochs")
-            logger.info(f"✓ Final clean epochs: {n_clean}")
+            logger.info(f"âœ“ Final clean epochs: {n_clean}")
             logger.info("="*60)
             
             self.processing_history.append(f'autoreject_{n_rejected}dropped')
             return epochs_clean, ar, reject_log
     
-    def apply_average_reference(self, raw, ref_channel='REF CZ', copy=True,
-                                set_ref_channel=True):
+    def apply_average_reference(self, raw, ref_channel='REF CZ',
+                                drop_reference_channel=True, copy=True):
         """
         Apply average reference using 3-step process.
         
         Steps:
         1. Re-reference to REF CZ
-        2. Drop REF CZ (now zeros)
+        2. Drop REF CZ (now zeros) [optional]
         3. Average reference remaining EEG
         
         Parameters
@@ -1014,11 +950,11 @@ class EEGPreprocessor:
         ref_channel : str or None
             Reference channel name (e.g., 'REF CZ')
             If None, direct average reference
+        drop_reference_channel : bool
+            If True (default), drop the REF channel after re-referencing.
+            If False, keep the REF channel in the data.
         copy : bool
             Copy data
-        set_ref_channel : bool
-            Set the reference channel as 'misc'. Set to False to
-            retain the physical reference channel in the data.
             
         Returns
         -------
@@ -1034,20 +970,16 @@ class EEGPreprocessor:
         
         if ref_channel is not None and ref_channel in raw.ch_names:
             logger.info(f"\n[Step 1] Re-reference to {ref_channel}")
-            raw.set_eeg_reference(ref_channels=[ref_channel], projection=False)      # 重新参考到 REF CZ
-
-            logger.info(f"✓ Re-referenced to {ref_channel}")
-
-            if  set_ref_channel:
-                logger.info(f"\n[Step 2] Set {ref_channel} as 'misc'")
-                raw.set_channel_types({ref_channel: 'misc'})
-                logger.info(f"✓ {ref_channel} has been set to 'misc'")
-            else:
-                logger.info(f"\n[Step 2] Keeping {ref_channel} in the data")
-
+            raw.set_eeg_reference(ref_channels=[ref_channel], projection=False)
+            logger.info(f"âœ“ Re-referenced to {ref_channel}")
+            
+            logger.info(f"\n[Step 2] Drop {ref_channel}")
+            raw.drop_channels([ref_channel])
+            logger.info(f"âœ“ Dropped {ref_channel}")
+            
             logger.info("\n[Step 3] Average reference")
-            raw.set_eeg_reference('average', projection=True)
-            logger.info("✓ Applied average reference")
+            raw.set_eeg_reference('average', projection=False)
+            logger.info("âœ“ Applied average reference")
             
             self.processing_history.append(f'avg_ref_via_{ref_channel}')
         else:
@@ -1055,12 +987,11 @@ class EEGPreprocessor:
                 logger.warning(f"'{ref_channel}' not found, using direct average")
             
             logger.info("Direct average reference")
-            raw.set_eeg_reference('average', projection=True)
-            logger.info("✓ Applied average reference")
+            raw.set_eeg_reference('average', projection=False)
+            logger.info("âœ“ Applied average reference")
             
             self.processing_history.append('avg_ref_direct')
         
-        raw.apply_proj()    # 应用投影器 
         logger.info("="*60)
         
         return raw
@@ -1082,8 +1013,8 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
                            drop_reference_channel=True,
                            reference_before_ica=True,
                            create_epochs=True, epoch_duration=2.0,
-                           epoch_overlap=0.0, epoch_tmin=None,
-                           epoch_tmax=None, epoch_baseline=None,
+                           epoch_tmin=None, epoch_tmax=None,
+                           epoch_overlap=0.0, epoch_baseline=None,
                            apply_autoreject=True,
                            autoreject_n_jobs=1, autoreject_reject_mode='drop',
                            **iclabel_kwargs):
@@ -1121,9 +1052,6 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
         Apply average reference (3-step process)
     ref_channel : str or None
         Reference channel name (e.g., 'REF CZ')
-    drop_reference_channel : bool
-        Drop the reference channel after re-referencing. Set to False to keep
-        the reference channel.
     reference_before_ica : bool
         If True, apply reference BEFORE ICA (RECOMMENDED for ICLabel)
         If False, apply reference AFTER ICA (old behavior)
@@ -1134,17 +1062,6 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
         Epoch duration in seconds (default: 2.0)
     epoch_overlap : float
         Overlap between epochs in seconds (default: 0.0)
-    epoch_tmin : float, optional
-        Start time of each epoch in seconds relative to its reference point.
-        If provided together with ``epoch_tmax``, these values will be used to
-        shift the fixed-length epochs so that they span ``epoch_tmin`` to
-        ``epoch_tmax``.
-    epoch_tmax : float, optional
-        End time of each epoch in seconds relative to its reference point.
-        Requires ``epoch_tmin`` to be set.
-    epoch_baseline : tuple | None
-        Baseline correction interval (in seconds) to apply to the epochs. Use
-        the same convention as ``mne.Epochs``.
     apply_autoreject : bool
         Apply Autoreject for automatic epoch cleaning
     autoreject_n_jobs : int
@@ -1243,19 +1160,17 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     # Apply reference BEFORE ICA (recommended for ICLabel)
     if apply_reference and reference_before_ica:
         logger.info("\n[STEP 3] Re-referencing (BEFORE ICA)")
-        logger.info("✓ This is the RECOMMENDED approach for ICLabel")
+        logger.info("âœ“ This is the RECOMMENDED approach for ICLabel")
         raw = preprocessor.apply_average_reference(
-            raw,
-            ref_channel=ref_channel,
-            copy=False,
-            drop_ref_channel=drop_reference_channel
+            raw, ref_channel=ref_channel,
+            drop_reference_channel=drop_reference_channel, copy=False
         )
     elif not reference_before_ica:
         logger.info("\n[STEP 3] Skipping re-reference (will apply after ICA)")
     else:
         logger.info("\n[STEP 3] Skipping re-reference")
         if use_iclabel:
-            logger.warning("⚠️  Warning: ICLabel works best with average reference before ICA")
+            logger.warning("âš ï¸  Warning: ICLabel works best with average reference before ICA")
     
     # ICA with ICLabel or traditional detection
     if apply_ica:
@@ -1280,10 +1195,8 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
         logger.info("\n[STEP 6] Re-referencing (AFTER ICA)")
         logger.info("Note: For ICLabel, it's better to reference BEFORE ICA")
         raw = preprocessor.apply_average_reference(
-            raw,
-            ref_channel=ref_channel,
-            copy=False,
-            drop_ref_channel=drop_reference_channel
+            raw, ref_channel=ref_channel,
+            drop_reference_channel=drop_reference_channel, copy=False
         )
     elif not apply_reference:
         logger.info("\n[STEP 6] Skipping re-reference")
@@ -1300,32 +1213,33 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     
     if create_epochs:
         logger.info("\n[STEP 7] Creating epochs")
-
+        # Compute epoch duration from tmin/tmax if provided
+        _epoch_duration = epoch_duration
         if epoch_tmin is not None and epoch_tmax is not None:
-            epoch_duration = epoch_tmax - epoch_tmin
-            if epoch_duration <= 0:
-                raise ValueError("epoch_tmax must be greater than epoch_tmin")
-
-            logger.info(
-                f"Using custom epoch window: tmin={epoch_tmin}s, tmax={epoch_tmax}s"
-            )
-        elif (epoch_tmin is None) != (epoch_tmax is None):
-            raise ValueError("Both epoch_tmin and epoch_tmax must be provided together")
-
+            _epoch_duration = epoch_tmax - epoch_tmin
+            logger.info(f"  Using epoch_tmin={epoch_tmin}, epoch_tmax={epoch_tmax} -> duration={_epoch_duration:.3f} s")
+        
         epochs = preprocessor.create_fixed_length_epochs(
-            raw, duration=epoch_duration, overlap=epoch_overlap, copy=False
+            raw, duration=_epoch_duration, overlap=epoch_overlap, copy=False
         )
-
-        if epoch_tmin is not None and epoch_tmax is not None:
-            epochs = epochs.shift_time(epoch_tmin, relative=True)
-            logger.info(
-                f"Shifted epochs to start at {epochs.tmin:.3f}s and end at {epochs.tmax:.3f}s"
-            )
-
+        
+        # Apply baseline correction if requested
         if epoch_baseline is not None:
-            logger.info(f"Applying baseline correction: {epoch_baseline}")
+            tmin_epoch = epochs.tmin
+            bl_start, bl_end = epoch_baseline
+            # make_fixed_length_epochs starts at t=0, so clip baseline if needed
+            if bl_start is not None and bl_start < tmin_epoch:
+                bl_start_clipped = tmin_epoch
+                logger.warning(
+                    f"  \u26a0 Baseline start {bl_start}s < epoch tmin {tmin_epoch:.3f}s "
+                    f"(fixed-length epochs always start at t=0). "
+                    f"Clipping baseline to ({bl_start_clipped}, {bl_end})."
+                )
+                epoch_baseline = (bl_start_clipped, bl_end)
+            logger.info(f"  Applying baseline correction: {epoch_baseline}")
             epochs.apply_baseline(epoch_baseline)
-
+            logger.info("\u2714 Baseline applied")
+        
         if apply_autoreject:
             logger.info("\n[STEP 8] Autoreject cleaning")
             ar_result = preprocessor.apply_autoreject(
@@ -1348,7 +1262,7 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     # ========================================
     
     logger.info("\n" + "="*70)
-    logger.info("✅ PREPROCESSING COMPLETE")
+    logger.info("âœ… PREPROCESSING COMPLETE")
     logger.info("="*70)
     logger.info(preprocessor.get_processing_summary())
     
@@ -1365,4 +1279,5 @@ def preprocess_eeg_complete(raw, detect_bad_channels=True, ransac=False,
     }
     
     return result
+
 
