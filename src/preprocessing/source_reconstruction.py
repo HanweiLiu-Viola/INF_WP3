@@ -21,7 +21,7 @@ import mne
 from scipy.io import loadmat
 import logging
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple, Union, Sequence
 import nibabel as nib
 
 logger = logging.getLogger(__name__)
@@ -611,7 +611,7 @@ class InverseSolutionComputer:
         self,
         tmin: Optional[float] = None,
         tmax: float = 0.0,
-        method: str = 'empirical',
+        method: str = 'auto',
         reg: float = 0.1
     ) -> mne.Covariance:
         """
@@ -624,7 +624,8 @@ class InverseSolutionComputer:
         tmax : float
             End time for baseline (default: 0.0)
         method : str
-            Covariance estimation method ('empirical', 'shrunk', etc.)
+            Covariance estimation method passed to
+            :func:`mne.compute_covariance` ('auto', 'empirical', 'oas', etc.)
         reg : float
             Regularization parameter (0 to 1). 
             Adds reg * np.mean(np.diag(cov)) to diagonal for stability.
@@ -911,7 +912,12 @@ def run_source_reconstruction_pipeline(
     method: str = 'sLORETA',
     lambda2: float = 1.0 / 9.0,
     noise_cov_reg: float = 0.1,
+    noise_cov_method: str = 'auto',
+    noise_cov_tmax: float = 0.0,
     roi_indices: Optional[List[int]] = None,
+    epoch_indices: Optional[Sequence[int]] = None,
+    max_epochs: Optional[int] = 200,
+    random_state: Optional[int] = None,
     n_jobs: int = 1
 ) -> Dict:
     """
@@ -934,8 +940,22 @@ def run_source_reconstruction_pipeline(
         Regularization parameter (1/SNR^2)
     noise_cov_reg : float
         Noise covariance regularization (0 to 1)
+    noise_cov_method : str
+        Method passed to :func:`mne.compute_covariance` (default ``'auto'``).
+    noise_cov_tmax : float
+        End time (in seconds) for the noise window used to estimate the
+        covariance (default 0.0, i.e., pre-stimulus baseline).
     roi_indices : list of int, optional
         Specific ROI indices to use
+    epoch_indices : sequence of int, optional
+        Explicit epoch indices to use for the inverse solution. If ``None`` the
+        pipeline will automatically subsample when ``max_epochs`` is provided.
+    max_epochs : int, optional
+        Maximum number of epochs to keep for the inverse calculation. ``None``
+        disables subsampling. This helps prevent notebook kernel shutdowns on
+        machines with limited memory.
+    random_state : int, optional
+        Seed used when randomly sub-sampling epochs.
     n_jobs : int
         Number of parallel jobs
         
@@ -952,6 +972,9 @@ def run_source_reconstruction_pipeline(
         - 'trans': Transform used
         - 'atlas': Atlas
         - 'method': Method used
+        - 'epochs_subset': Epochs object actually used in the inverse step
+        - 'epoch_indices': Indices (relative to the original epochs) that were
+          retained
     """
     logger.info("\n" + "="*60)
     logger.info("SOURCE RECONSTRUCTION PIPELINE v2.0")
@@ -966,7 +989,38 @@ def run_source_reconstruction_pipeline(
         logger.error("Please load 3D coordinates from coordinates.xml before running!")
         raise ValueError(message)
     logger.info(f"  {message}")
-    
+
+    # Step 0b: Select epochs to use (helps prevent OOM in notebooks)
+    n_epochs_total = len(epochs)
+    selection: Optional[np.ndarray]
+    selection = None
+
+    if epoch_indices is not None:
+        selection = np.unique(np.asarray(epoch_indices, dtype=int))
+        selection = selection[(selection >= 0) & (selection < n_epochs_total)]
+        if selection.size == 0:
+            raise ValueError("Provided epoch_indices do not select any epochs.")
+        logger.info(
+            "Using user-provided epoch indices (%d of %d epochs)",
+            selection.size,
+            n_epochs_total,
+        )
+    elif max_epochs is not None and n_epochs_total > max_epochs:
+        rng = np.random.default_rng(random_state)
+        selection = np.sort(rng.choice(n_epochs_total, size=max_epochs, replace=False))
+        logger.info(
+            "Subsampling epochs to avoid memory issues: using %d/%d epochs",
+            selection.size,
+            n_epochs_total,
+        )
+
+    if selection is not None:
+        epochs_used = epochs[selection].copy()
+    else:
+        epochs_used = epochs.copy()
+
+    logger.info("Epochs to process: %d", len(epochs_used))
+
     # Step 0.5: Load and validate trans file
     trans = None
     if trans_file is not None:
@@ -1000,18 +1054,22 @@ def run_source_reconstruction_pipeline(
     
     # Step 4: Compute forward solution
     logger.info("\n[STEP 4] Computing forward solution...")
-    fwd_builder = ForwardSolutionBuilder(epochs, src, trans=trans)
+    fwd_builder = ForwardSolutionBuilder(epochs_used, src, trans=trans)
     fwd = fwd_builder.compute_forward(n_jobs=n_jobs)
-    
+
     # Step 5: Compute inverse solution
     logger.info("\n[STEP 5] Computing inverse solution...")
-    inv_computer = InverseSolutionComputer(epochs, fwd)
-    inv_computer.compute_noise_covariance(reg=noise_cov_reg)
+    inv_computer = InverseSolutionComputer(epochs_used, fwd)
+    inv_computer.compute_noise_covariance(
+        reg=noise_cov_reg,
+        method=noise_cov_method,
+        tmax=noise_cov_tmax,
+    )
     inv_computer.make_inverse_operator()
-    
+
     # Apply to average
     stc = inv_computer.apply_inverse(method=method, lambda2=lambda2)
-    
+
     # Apply to individual epochs
     stcs_epochs = inv_computer.apply_inverse_epochs(method=method, lambda2=lambda2)
     
@@ -1043,5 +1101,7 @@ def run_source_reconstruction_pipeline(
         'inv': inv_computer.inverse_operator,
         'trans': trans,
         'atlas': atlas,
-        'method': method
+        'method': method,
+        'epochs_subset': epochs_used,
+        'epoch_indices': selection if selection is not None else np.arange(len(epochs_used)),
     }
